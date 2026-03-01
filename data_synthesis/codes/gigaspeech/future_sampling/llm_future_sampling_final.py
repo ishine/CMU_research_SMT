@@ -2,9 +2,9 @@
 """
 Future Source Sampling (Final) -- Dual-model architecture + word alignment.
 
-Base model   (Qwen3-30B-A3B-FP8):   pure text continuation via llm.generate()
-Instruct model (vllm serve):        translation + LLM-select-best via OpenAI API
-Align model  (awesome-align, CPU):   word-level alignment for safe truncation
+Base model   (e.g. Qwen3-4B):       pure text continuation via llm.generate() (no reasoning needed)
+Instruct model (vllm serve):        translation (completion from committed) + LLM judge via OpenAI API
+Align model  (awesome-align, GPU):  word-level alignment for safe truncation (can share GPU with base)
 
 Algorithm (per 960ms chunk):
   1. Accumulate observed source words.
@@ -20,14 +20,17 @@ Usage:
   # Start instruct serve on GPU 1 first:
   CUDA_VISIBLE_DEVICES=1 vllm serve MODEL --served-model-name qwen3-instruct --port 8100
 
-  # Then run this script on GPU 0:
+  # Then run this script on GPU 0 (base + align share the card when using 4B):
   CUDA_VISIBLE_DEVICES=0 python llm_future_sampling_final.py \\
     --input-tsv MANIFEST.tsv --output-root OUT --test-one
+  # With 4B base + align on same GPU, use e.g. --gpu-memory-utilization 0.85.
 """
 
 import argparse
 import ast
 import asyncio
+import bisect
+import contextlib
 import csv
 import itertools
 import json
@@ -35,15 +38,21 @@ import math
 import os
 import re
 import sys
+import threading
 import time
 import unicodedata
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from tqdm import tqdm
 from vllm import LLM, SamplingParams
 from openai import OpenAI, AsyncOpenAI
+
+# Lock that serialises base_llm.generate() when running parallel utterances.
+# None when running single-threaded (no overhead).
+_base_llm_lock: Optional[threading.Lock] = None
 
 
 # ===================================================================
@@ -58,13 +67,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-root", required=True)
 
     p.add_argument("--base-model-path",
-                   default="/data/user_data/haolingp/models/Qwen3-30B-A3B-FP8")
-    p.add_argument("--instruct-api-base", default="http://localhost:8100/v1")
+                   default="/data/user_data/haolingp/models/Qwen3-4B-Base")    p.add_argument("--instruct-api-base", default="http://localhost:8100/v1")
     p.add_argument("--instruct-model-name", default="qwen3-instruct")
     p.add_argument("--instruct-tokenizer-path",
                    default="/data/user_data/haolingp/models/Qwen3-30B-A3B-Instruct-2507-FP8",
                    help="Local tokenizer path used to build manual chat-template prompts for instruct generate.")
     p.add_argument("--tp", type=int, default=1)
+    p.add_argument("--gpu-memory-utilization", type=float, default=0.85,
+                   help="vLLM GPU memory fraction for base model. Use 0.80-0.85 when align model shares the same GPU.")
+    p.add_argument("--align-device", default="cuda:0",
+                   help="Device for awesome-align (e.g. cuda:0 to share with base for speed; use cpu if OOM).")
 
     p.add_argument("--task-id", type=int, default=0)
     p.add_argument("--num-tasks", type=int, default=1)
@@ -89,6 +101,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--test-one", action="store_true")
     p.add_argument("--utt-id", default=None)
     p.add_argument("--verbose", action="store_true")
+    p.add_argument("--translation-cache-dir", default=None,
+                   help="Directory of pre-computed full translations (task_*.jsonl). "
+                        "If provided, used as reference instead of calling translate_final().")
+    p.add_argument("--final-commit-backend", choices=["instruct", "base"], default="instruct",
+                   help="Backend for end-of-utterance final commit. Use instruct to avoid base-model thinking leakage.")
+    p.add_argument("--parallel-utterances", type=int, default=1,
+                   help="Number of utterances to process concurrently.  "
+                        "base_llm.generate() calls are serialised via a lock; "
+                        "HTTP (translate/judge) and alignment calls overlap freely.  "
+                        "Recommended: 2-4 on a single-node setup.")
+    p.add_argument("--judge-prompt-version", choices=["full", "short"], default="short",
+                   help="Judge prompt: 'full' = original long prompt + max_tokens=256; "
+                        "'short' = shortened prompt + max_tokens=64 (faster).")
 
     return p.parse_args()
 
@@ -130,7 +155,10 @@ def normalize_zh(text: str) -> str:
 
 
 def clean_llm_output(text: str) -> str:
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    # Handle truncated outputs like "<think>..." without a closing tag.
+    text = re.sub(r"<think>.*$", "", text, flags=re.DOTALL | re.IGNORECASE)
+    text = text.replace("</think>", "")
     text = text.strip().strip('"').strip("'")
     text = text.strip("\u201c\u201d\u2018\u2019")
     text = text.strip('"').strip("'")
@@ -161,8 +189,6 @@ def sanitize_filename(name: str) -> str:
 
 
 _WORD_HEAD_CHARS = set("一这那其某各该此每两几何")
-
-
 def _ends_on_word_head(text: str) -> bool:
     """Return True if text ends on a character that typically starts a Chinese word."""
     return bool(text) and text[-1] in _WORD_HEAD_CHARS
@@ -298,7 +324,7 @@ def compute_laal(
     reference: str,
 ) -> float:
     """Text LAAL using source-word count as source-time surrogate."""
-    timeline: List[int] = []
+    timeline: List[int] = [] # timeline[i] = 第 i+1 个输出字符产生时，系统已读了多少源词。
     source_read = 0
 
     for chunk, delta, action in zip(source_chunks, target_deltas, actions):
@@ -306,12 +332,12 @@ def compute_laal(
         source_read += words_in_chunk
         if action == "WRITE" and str(delta).strip():
             for _ in str(delta).strip():
-                timeline.append(source_read)
+                timeline.append(source_read) # timeline[i] = 第 i+1 个输出字符产生时，系统已读了多少源词。
 
     y = "".join(d for d in target_deltas if d)
-    y_len = len(y)
+    y_len = len(y) # 系统输出总长度（把所有 target_deltas 拼接后长度）
     yref_len = len(str(reference).replace(" ", ""))
-    x_len = sum(
+    x_len = sum(  # 源文本总词数
         len(str(c).strip().split())
         for c in source_chunks
         if str(c).strip()
@@ -320,18 +346,20 @@ def compute_laal(
     if y_len == 0 or x_len == 0 or yref_len == 0:
         return float("nan")
 
-    denom = max(y_len, yref_len)
-    cutoff = min(y_len, yref_len, len(timeline))
-    if cutoff <= 0:
+    denom = max(y_len, yref_len)  # laal 关键改动
+    if denom <= 0 or len(timeline) == 0:
         return float("nan")
-
+    # Per Papi et al. 2022 (LAAL): sum from i=1 to max(|Y|,|Y*|).
+    # For positions i > |Y| (system output too short), d(i) = x_len (fully delayed).
+    # Divide by denom = max(|Y|, |Y*|).
     total_lagging = 0.0
-    for i in range(1, cutoff + 1):
-        d_i = timeline[i - 1]
+    for i in range(1, denom + 1):
+        # 如果系统输出太短（i 超出 timeline），用 x_len（表示“拖到最后才出”）
+        d_i = timeline[i - 1] if i <= len(timeline) else x_len 
         d_star_i = (i - 1) * x_len / denom
         total_lagging += (d_i - d_star_i)
 
-    return total_lagging / cutoff
+    return total_lagging / denom  # 最后除以 denom 得到平均延迟。
 
 
 def _char_tokens_zh(text: str) -> List[str]:
@@ -408,13 +436,21 @@ class _TeeWriter:
 # Word Alignment  (awesome-align, CPU-only)
 # ===================================================================
 
-def load_align_model(cache_dir: Optional[str] = None):
-    """Load awesome-align BERT model onto CPU."""
+def load_align_model(cache_dir: Optional[str] = None, device: Optional[str] = None):
+    """Load awesome-align BERT model.
+
+    Defaults to CUDA if available so BERT inference runs on GPU alongside the
+    base model.  Must be called BEFORE loading vLLM so the ~400 MB footprint is
+    already accounted for when vLLM profiles free GPU memory.
+    """
     from transformers import AutoModel, AutoTokenizer
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
     model_name = "aneuraz/awesome-align-with-co"
     tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir)
     model = AutoModel.from_pretrained(model_name, cache_dir=cache_dir)
-    model = model.cpu().eval()
+    model = model.to(device).eval()
+    print(f"[Align] Model loaded on {device}.")
     return model, tokenizer
 
 
@@ -431,91 +467,165 @@ def get_word_alignments(
     Returns list of (src_word_idx, tgt_char_idx) pairs using
     bidirectional argmax intersection, falling back to forward-only.
     """
-    src_words = src_text.strip().split() # 按空格切成词
-    tgt_chars = list(tgt_text.strip().replace(" ", "")) #按“单个汉字”切字符
+    src_words = src_text.strip().split()  # 按空格切成词
+    tgt_chars = list(tgt_text.strip().replace(" ", ""))  # 按“单个汉字”切字符
 
     if not src_words or not tgt_chars:
         return []
-    # awesome-align 用的是一个 BERT 模型（aneuraz/awesome-align-with-co）：
+
     src_subwords = [align_tokenizer.tokenize(w) for w in src_words]
     tgt_subwords = [align_tokenizer.tokenize(c) for c in tgt_chars]
-
     src_subwords = [sw if sw else [align_tokenizer.unk_token] for sw in src_subwords]
     tgt_subwords = [sw if sw else [align_tokenizer.unk_token] for sw in tgt_subwords]
 
-    src_ids = [align_tokenizer.convert_tokens_to_ids(sw) for sw in src_subwords]
-    tgt_ids = [align_tokenizer.convert_tokens_to_ids(sw) for sw in tgt_subwords]
+    # awesome-align (BERT) 单次前向最多支持 512 positions:
+    # [CLS] + src + [SEP] + tgt + [SEP] -> src+tgt budget = max_pos-3
+    max_pos = int(getattr(getattr(align_model, "config", None), "max_position_embeddings", 512) or 512)
+    if max_pos <= 3:
+        max_pos = 512
+    per_pass_budget = max_pos - 3
+    max_joint_subwords = 1024  # user requested upper limit
 
-    src_flat = list(itertools.chain.from_iterable(src_ids))
-    tgt_flat = list(itertools.chain.from_iterable(tgt_ids))
+    def _align_single(
+        src_sw: List[List[str]],
+        tgt_sw: List[List[str]],
+    ) -> List[Tuple[int, int]]:
+        src_ids = [align_tokenizer.convert_tokens_to_ids(sw) for sw in src_sw]
+        tgt_ids = [align_tokenizer.convert_tokens_to_ids(sw) for sw in tgt_sw]
+        src_flat = list(itertools.chain.from_iterable(src_ids))
+        tgt_flat = list(itertools.chain.from_iterable(tgt_ids))
+        if len(src_flat) + len(tgt_flat) > per_pass_budget:
+            return []
 
-    # 拼成 [CLS] + src + [SEP] + tgt + [SEP]
-    #src 和 tgt 放在同一个序列里，模型 self-attention 可以联合建模两边上下文
-    # [SEP] 用来明确分界（source 到哪结束，target 从哪开始）
-   # [CLS] 是 BERT 习惯性的起始 token（很多预训练格式都要求
-    input_ids = (
-        [align_tokenizer.cls_token_id]
-        + src_flat
-        + [align_tokenizer.sep_token_id]
-        + tgt_flat
-        + [align_tokenizer.sep_token_id]
-    )
-    token_type_ids = (  # 用 0/1 区分 source / target  : BERT 预训练时就用这个区分 sentence A / sentence B，所以这里沿用这个机制
-        [0] * (1 + len(src_flat) + 1)
-        + [1] * (len(tgt_flat) + 1)
-    )
-
-    ids_t = torch.tensor([input_ids])
-    tt_t = torch.tensor([token_type_ids])
-    am_t = torch.ones_like(ids_t)
-
-    with torch.no_grad():
-        outputs = align_model(
-            input_ids=ids_t,
-            token_type_ids=tt_t,
-            attention_mask=am_t,
-            output_hidden_states=True,
+        input_ids = (
+            [align_tokenizer.cls_token_id]
+            + src_flat
+            + [align_tokenizer.sep_token_id]
+            + tgt_flat
+            + [align_tokenizer.sep_token_id]
+        )
+        token_type_ids = (
+            [0] * (1 + len(src_flat) + 1)
+            + [1] * (len(tgt_flat) + 1)
         )
 
-    hidden = outputs.hidden_states[8][0]  # layer 8, awesome-align default
+        _dev = next(align_model.parameters()).device
+        ids_t = torch.tensor([input_ids]).to(_dev)
+        tt_t = torch.tensor([token_type_ids]).to(_dev)
+        am_t = torch.ones_like(ids_t)
 
-    # -- aggregate sub-word embeddings back to word / char level ----------
-    src_embeds: List[torch.Tensor] = []
-    offset = 1  # skip [CLS]
-    for sw in src_subwords:
-        n = len(sw)
-        src_embeds.append(hidden[offset:offset + n].mean(dim=0))
-        offset += n
+        with torch.no_grad():
+            outputs = align_model(
+                input_ids=ids_t,
+                token_type_ids=tt_t,
+                attention_mask=am_t,
+                output_hidden_states=True,
+            )
 
-    tgt_embeds: List[torch.Tensor] = []
-    offset = 1 + len(src_flat) + 1  # skip [CLS] src [SEP]
-    for sw in tgt_subwords:
-        n = len(sw)
-        tgt_embeds.append(hidden[offset:offset + n].mean(dim=0))
-        offset += n
+        hidden = outputs.hidden_states[8][0]  # layer 8, awesome-align default
 
-    src_mat = torch.nn.functional.normalize(torch.stack(src_embeds), dim=-1)
-    tgt_mat = torch.nn.functional.normalize(torch.stack(tgt_embeds), dim=-1)
+        src_embeds: List[torch.Tensor] = []
+        offset = 1  # skip [CLS]
+        for sw in src_sw:
+            n = len(sw)
+            src_embeds.append(hidden[offset:offset + n].mean(dim=0))
+            offset += n
 
+        tgt_embeds: List[torch.Tensor] = []
+        offset = 1 + len(src_flat) + 1  # skip [CLS] src [SEP]
+        for sw in tgt_sw:
+            n = len(sw)
+            tgt_embeds.append(hidden[offset:offset + n].mean(dim=0))
+            offset += n
 
-    # 余弦相似度矩阵 + 双向 argmax
-    sim = src_mat @ tgt_mat.t()  # (n_src, n_tgt)
+        src_mat = torch.nn.functional.normalize(torch.stack(src_embeds), dim=-1)
+        tgt_mat = torch.nn.functional.normalize(torch.stack(tgt_embeds), dim=-1)
+        sim = src_mat @ tgt_mat.t()
 
-    fwd = sim.argmax(dim=1)  # best tgt for each src # 每个 src word 找最像的 tgt char
-    bwd = sim.argmax(dim=0)  # best src for each tgt # 每个 tgt char 找最像的 src word
+        fwd = sim.argmax(dim=1)
+        bwd = sim.argmax(dim=0)
 
-    # 只有当 src->tgt 的最佳匹配，反过来 tgt->src 也选回这个 src，才保留。
-    inter = [
-        (s, fwd[s].item())
-        for s in range(len(src_words))
-        if bwd[fwd[s].item()].item() == s
-    ]
-    # 如果 inter 为空，就 fallback：只用 forward 对齐（每个 src word 选一个 tgt char）
-    if inter:
-        return inter
+        inter = [
+            (s, fwd[s].item())
+            for s in range(len(src_sw))
+            if bwd[fwd[s].item()].item() == s
+        ]
+        if inter:
+            return inter
+        return [(s, fwd[s].item()) for s in range(len(src_sw))]
 
-    #返回格式是：[(src_word_idx, tgt_char_idx), ...]
-    return [(s, fwd[s].item()) for s in range(len(src_words))]
+    src_token_lens = [len(sw) for sw in src_subwords]
+    tgt_token_lens = [len(sw) for sw in tgt_subwords]
+    src_total = sum(src_token_lens)
+    tgt_total = sum(tgt_token_lens)
+    joint_total = src_total + tgt_total
+
+    # Fast path: fits in one pass.
+    if joint_total <= per_pass_budget:
+        return _align_single(src_subwords, tgt_subwords)
+
+    # Hard guard requested: do not attempt alignment beyond 1024 subwords.
+    if joint_total > max_joint_subwords:
+        return []
+
+    # 513..1024: two-pass alignment with global index offsets.
+    src_n = len(src_subwords)
+    tgt_n = len(tgt_subwords)
+    if src_n < 2 or tgt_n < 2:
+        return []
+
+    src_ps = [0]
+    for v in src_token_lens:
+        src_ps.append(src_ps[-1] + v)
+    tgt_ps = [0]
+    for v in tgt_token_lens:
+        tgt_ps.append(tgt_ps[-1] + v)
+
+    src_mid = src_total / 2.0
+    tgt_mid = tgt_total / 2.0
+    split_pair: Optional[Tuple[int, int]] = None
+    best_score = float("inf")
+
+    for s_split in range(1, src_n):
+        left_src = src_ps[s_split]
+        right_src = src_total - left_src
+        if left_src > per_pass_budget or right_src > per_pass_budget:
+            continue
+
+        # Need: left_tgt <= per_pass_budget-left_src and right_tgt <= per_pass_budget-right_src
+        lower = tgt_total - (per_pass_budget - right_src)
+        upper = per_pass_budget - left_src
+        if lower > upper:
+            continue
+
+        lo_idx = bisect.bisect_left(tgt_ps, lower, 1, tgt_n)
+        hi_idx = bisect.bisect_right(tgt_ps, upper, 1, tgt_n) - 1
+        if lo_idx > hi_idx:
+            continue
+
+        target = tgt_mid
+        cand = bisect.bisect_left(tgt_ps, target, lo_idx, hi_idx + 1)
+        for t_split in (cand - 1, cand):
+            if t_split < lo_idx or t_split > hi_idx:
+                continue
+            if t_split <= 0 or t_split >= tgt_n:
+                continue
+            score = abs(left_src - src_mid) + abs(tgt_ps[t_split] - tgt_mid)
+            if score < best_score:
+                best_score = score
+                split_pair = (s_split, t_split)
+
+    if split_pair is None:
+        return []
+
+    s_split, t_split = split_pair
+    left = _align_single(src_subwords[:s_split], tgt_subwords[:t_split])
+    right = _align_single(src_subwords[s_split:], tgt_subwords[t_split:])
+
+    out: List[Tuple[int, int]] = []
+    out.extend(left)
+    out.extend((s + s_split, t + t_split) for s, t in right)
+    return out
 
 
 def truncate_by_alignment(
@@ -626,45 +736,91 @@ def build_score_prompt(
         "- Over-translation means translating content that is NOT YET present in the observed English.\n"
         "- If the delta translates words that ARE already present in observed English, that is CORRECT and should NOT be penalized.\n"
         "- If delta starts mid-phrase because of truncation, evaluate it using full_prefix_so_far and committed Chinese as context.\n\n"
+        "## Hanging / incomplete English sources\n"
+        "- The observed English is often an INCOMPLETE sentence that ends mid-clause (e.g. ends with an adverb or conjunction).\n"
+        "- A delta that faithfully translates ALL observed words and then STOPS is CORRECT even if the Chinese also hangs mid-air.\n"
+        "- Do NOT penalize a delta just because it ends without a continuation particle.\n"
+        "- Adding a continuation particle (地会, 地是, 地都是, 地将, 的是, etc.) that goes BEYOND the observed English words\n"
+        "  is MILD over-translation: deduct 15-25 points.\n\n"
         "Scoring criteria:\n"
         "- 90-100: Perfectly faithful, natural, no over-translation\n"
-        "- 70-89: Mostly correct, minor issues\n"
-        "- 50-69: Partially correct or slightly over-translated\n"
-        "- 0-49: Wrong translation or significant over-translation\n\n"
+        "- 70-89: Mostly correct, minor issues or mild over-translation (e.g. a continuation particle)\n"
+        "- 50-69: Partially correct or moderately over-translated\n"
+        "- 0-49: Wrong translation, hallucination, or significant over-translation\n\n"
         "Deduction rules:\n"
-        "- DO NOT deduct: delta covers ALL words in observed English faithfully\n"
+        "- NEVER deduct: delta faithfully covers ALL words in observed English (even if Chinese sentence hangs)\n"
         "- DO NOT deduct: new_delta_only starts mid-word/phrase due to truncation (use full_prefix_so_far as context)\n"
-        "- DO deduct heavily: delta includes content not supported by observed English\n"
+        "- Deduct 15-25: delta adds a Chinese continuation particle (地会/地是/地将/地都是/的是 etc.) beyond observed English\n"
+        "- Deduct heavily: delta includes semantic content (nouns, verbs, clauses) not in observed English\n"
         "- Deduct for mistranslation, hallucination, semantic drift, awkward continuation\n"
         "- Deduct if the new delta contradicts or degrades the committed context\n"
         "- Do NOT reward a candidate just because committed content (already fixed) is good\n\n"
         "Few-shot examples:\n"
-        'Example 1 (good):\n'
+        'Example 1 (good - full faithful translation):\n'
         '  Observed: "monotonous and unavailing"\n'
         '  Committed: ""\n'
         '  Delta: "显得单调乏味且毫无成效"\n'
         '  Score: 92\n\n'
-        'Example 2 (partial/incomplete):\n'
+        'Example 2 (partial/incomplete - under-translation):\n'
         '  Observed: "monotonous and unavailing"\n'
         '  Committed: ""\n'
         '  Delta: "显得单调"\n'
         '  Score: 68\n\n'
-        'Example 3 (truncation artifact, good):\n'
-        '  Observed: "And these introductions are"\n'
-        '  Committed: "而且这"\n'
-        '  FullPrefix: "而且这些介绍不可避免"\n'
-        '  Delta: "些介绍不可避免"\n'
-        '  Score: 82\n'
-        'Example 4 (bad over-translation):\n'
+        'Example 3 (good - faithful hanging translation, sentence left open):\n'
+        '  Observed: "And these introductions are inevitably"\n'
+        '  Committed: ""\n'
+        '  FullPrefix: "而这些介绍不可避免"\n'
+        '  Delta: "而这些介绍不可避免"\n'
+        '  Score: 88\n'
+        '  Reason: faithfully translates ALL observed words; "不可避免"=inevitably; '
+        'sentence hangs like the English, which is correct for simultaneous translation.\n\n'
+        'Example 4 (mild over-translation - adds continuation particle beyond observed source):\n'
+        '  Observed: "And these introductions are inevitably"\n'
+        '  Committed: ""\n'
+        '  FullPrefix: "而这些介绍不可避免地会"\n'
+        '  Delta: "而这些介绍不可避免地会"\n'
+        '  Score: 73\n'
+        '  Reason: "地会" (will) commits to future verb structure not yet observed; mild over-translation.\n\n'
+        'Example 5 (bad over-translation - fabricated future content):\n'
         '  Observed: "And these introductions are"\n'
         '  Committed: "而且这"\n'
         '  FullPrefix: "而且这些介绍出于文学上的诚实感"\n'
         '  Delta: "些介绍出于文学上的诚实感"\n'
-        '  Score: 40\n\n'
+        '  Score: 40\n'
+        '  Reason: "出于文学上的诚实感" is fabricated semantic content completely absent from observed English.\n\n'
         f"{candidates_str}\n\n"
         "Output STRICT JSON only in this format:\n"
         '{"scores":[{"candidate_id":1,"score":87,"tags":["ok"]},{"candidate_id":2,"score":41,"tags":["mistranslation","drift"]}]}\n'
         "Do not include any extra text."
+    )
+
+
+def build_score_prompt_short(
+    observed_source: str,
+    committed: str,
+    candidate_items: List[Dict[str, Any]],
+) -> str:
+    """Shortened judge prompt (~half length) for faster inference. Use with max_tokens=64."""
+    candidates_str = "\n".join(
+        (
+            f'Candidate {item["candidate_id"]}:\n'
+            f'  full_prefix_so_far: "{item["safe_prefix"]}"\n'
+            f'  new_delta_only: "{item["delta"]}"'
+        )
+        for item in candidate_items
+    )
+    return (
+        "Score incremental simultaneous-translation candidates (new_delta only).\n\n"
+        f'Observed English: "{observed_source}"\n'
+        f'Committed Chinese: "{committed}"\n\n'
+        "Over-translation = translating content NOT in observed English. "
+        "Faithful delta for observed words = correct. "
+        "90-100: faithful, natural; 70-89: minor issues; 50-69: partial; 0-49: wrong/over-translation.\n\n"
+        "Example good: Observed \"monotonous and unavailing\", Delta \"显得单调乏味且毫无成效\" -> 92\n"
+        "Example bad:  Observed \"And these introductions are\", Delta \"些介绍出于文学上的诚实感\" -> 40 (fabricated)\n\n"
+        f"{candidates_str}\n\n"
+        "Output JSON only:\n"
+        '{"scores":[{"candidate_id":1,"score":87},{"candidate_id":2,"score":41}]}'
     )
 
 
@@ -688,7 +844,8 @@ def sample_source_futures(
         top_k=50,
         presence_penalty=0.6,
     )
-    outputs = base_llm.generate([observed_source], params)
+    with (_base_llm_lock if _base_llm_lock is not None else contextlib.nullcontext()):
+        outputs = base_llm.generate([observed_source], params)
 
     futures: List[str] = []
     for out in outputs[0].outputs:
@@ -731,7 +888,11 @@ def _build_translation_prompt_text(
     observed_source: str,
     committed: str,
 ) -> str:
-    """Manual generation text in mentor style: append committed in assistant turn."""
+    """Build prompt for completion API: committed translation is FIXED (in prompt), model generates ONLY the continuation.
+
+    Used with completions.create(): the server returns only the new tokens after the prompt,
+    so we get committed (unchanged) + continuation without re-generating committed.
+    """
     messages = [{
         "role": "user",
         "content": (
@@ -745,8 +906,8 @@ def _build_translation_prompt_text(
         add_generation_prompt=False,
         tokenize=False,
     )
-    # Manually open assistant turn so the model continues from committed.
-    text += "<|im_start|>assistant\n" #手动加 <|im_start|>assistant\n + committed 作为 prefill
+    # Assistant turn: prefill with committed so completion = only new translation.
+    text += "<|im_start|>assistant\n"
     if committed:
         text += normalize_zh(committed)
     return text
@@ -832,24 +993,31 @@ def translate_candidates(
     futures: List[str],
     committed: str = "",
 ) -> List[str]:
-    """Translate observed+future for each candidate, continuing from committed.
+    """Translate observed+future for each candidate via completion: committed is FIXED, only continuation is generated.
 
+    Uses completions.create() with prompt ending at committed; server returns new tokens only.
     Returns M full translations (committed + extension).
     """
-    sources = []  # 送到 instruct server（GPU1 的 vllm serve）做翻译
-    for future in futures:  
+    sources = []
+    for future in futures:
         full = (observed_source + " " + future).strip() if future else observed_source
         sources.append(full)
 
-    # With assistant prefill, each item in extensions is ONLY the continuation
-    # (the model never sees a chance to re-translate from scratch).
+    # Prompt ends with committed → API returns only continuation. If server ever returns full sequence, we dedupe below.
     extensions = asyncio.run(
         _translate_batch_with_client_async(
             api_base, model, instruct_tokenizer, sources, committed
         )
     )
     committed_norm = normalize_zh(committed) if committed else ""
-    return [committed_norm + normalize_zh(ext) for ext in extensions]
+    out = []
+    for ext in extensions:
+        ext_norm = normalize_zh(ext)
+        if committed_norm and ext_norm.startswith(committed_norm):
+            out.append(ext_norm)  # model already returned full translation
+        else:
+            out.append(committed_norm + ext_norm)
+    return out
 
 
 def translate_final(
@@ -878,6 +1046,38 @@ def translate_final(
             return cleaned
         return committed_norm + cleaned
     return cleaned
+
+
+def translate_final_base(
+    base_llm: LLM,
+    instruct_tokenizer,
+    full_source: str,
+    committed: str,
+) -> str:
+    """Final tail commit using base model generate (no instruct API call).
+
+    Builds the chat-template prefill with the committed translation already in
+    the assistant turn, then lets the base model continue to the end.  This
+    avoids calling the instruct server and any fragile character-splitting.
+    """
+    prompt_text = _build_translation_prompt_text(
+        instruct_tokenizer,
+        observed_source=full_source,
+        committed=committed,
+    )
+    params = SamplingParams(
+        temperature=0.0,
+        max_tokens=512,
+        stop=["<|im_end|>"],
+    )
+    with (_base_llm_lock if _base_llm_lock is not None else contextlib.nullcontext()):
+        outputs = base_llm.generate([prompt_text], params)
+    continuation = (outputs[0].outputs[0].text or "").strip()
+    continuation = normalize_zh(clean_llm_output(continuation))
+
+    committed_norm = normalize_zh(committed) if committed else ""
+    # The model continues from the prefill, so its output is only the new part.
+    return committed_norm + continuation
 
 
 def select_best_candidate(
@@ -925,20 +1125,31 @@ def score_candidate_prefixes(
     observed_source: str,
     committed: str,
     candidate_items: List[Dict[str, Any]],
+    prompt_version: str = "full",
 ) -> List[Dict[str, Any]]:
-    """LLM scores alignment-truncated candidate prefixes. Returns aligned list."""
+    """LLM scores alignment-truncated candidate prefixes. Returns aligned list.
+
+    prompt_version: 'full' = build_score_prompt + max_tokens=256; 'short' = build_score_prompt_short + max_tokens=64.
+    """
     if not candidate_items:
         return []
 
+    use_short = prompt_version == "short"
+    user_prompt = (
+        build_score_prompt_short(observed_source, committed, candidate_items)
+        if use_short
+        else build_score_prompt(observed_source, committed, candidate_items)
+    )
+    max_tokens = 64 if use_short else 256
+
     # LLM 打分器 + 容错解析器
     client = _make_sync_client(api_base)
-    user_prompt = build_score_prompt(observed_source, committed, candidate_items)
     prompt_text = _build_instruct_generate_prompt(instruct_tokenizer, user_prompt)
     resp = client.completions.create(
         model=model,
         prompt=prompt_text,
         temperature=0.0,
-        max_tokens=256,
+        max_tokens=max_tokens,
     )
     raw = (resp.choices[0].text or "").strip()
     text = clean_llm_output(raw).strip()
@@ -1020,6 +1231,7 @@ def process_one_utterance(
     row: Dict[str, str],
     args: argparse.Namespace,
     verbose_log_file: Optional[Any] = None,
+    translation_cache: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     full_source_text = " ".join(sentences)
     n_chunks = len(trajectory)
@@ -1077,11 +1289,19 @@ def process_one_utterance(
         # --- Case 2: Last chunk -> force commit ---
         if is_last:
             t_final0 = time.perf_counter()
-            full_translation = translate_final(
-                api_base, instruct_model,
-                instruct_tokenizer,
-                accumulated_source, committed_norm,
-            )
+            if args.final_commit_backend == "base":
+                full_translation = translate_final_base(
+                    base_llm,
+                    instruct_tokenizer,
+                    accumulated_source, committed_norm,
+                )
+            else:
+                full_translation = translate_final(
+                    api_base,
+                    instruct_model,
+                    instruct_tokenizer,
+                    accumulated_source, committed_norm,
+                )
             t_final = time.perf_counter() - t_final0
             timing_totals["translate_final_s"] += t_final
             if len(full_translation) > len(committed_norm):
@@ -1250,7 +1470,8 @@ def process_one_utterance(
         t4_0 = time.perf_counter()
         scores = score_candidate_prefixes(
             api_base, instruct_model, instruct_tokenizer,
-            accumulated_source, committed_norm, judge_items
+            accumulated_source, committed_norm, judge_items,
+            prompt_version=getattr(args, "judge_prompt_version", "full"),
         )
         t4 = time.perf_counter() - t4_0
         timing_totals["step4_judge_score_s"] += t4
@@ -1356,18 +1577,23 @@ def process_one_utterance(
     action_list = [d[0] for d in decisions]
     system_output_text = "".join(d for d in target_deltas if d)
 
-    # LAAL reference: rerun a full offline translation with the instruct model.
-    # This matches the user's requested approximation when no gold reference exists.
+    # LAAL reference: use pre-computed cache if available, otherwise call translate_final().
     laal_reference_text = ""
     laal_value = float("nan")
     laal_error: Optional[str] = None
     bleu_char_value = float("nan")
     bleu_char_error: Optional[str] = None
+    laal_reference_mode = "llm_full_translation"
     try:
-        laal_reference_text = translate_final(
-            api_base, instruct_model, instruct_tokenizer,
-            full_source_text, "",
-        )
+        cached_translation = (translation_cache or {}).get(utt_id)
+        if cached_translation:
+            laal_reference_text = cached_translation
+            laal_reference_mode = "cache"
+        else:
+            laal_reference_text = translate_final(
+                api_base, instruct_model, instruct_tokenizer,
+                full_source_text, "",
+            )
         laal_value = compute_laal(
             trajectory,
             target_deltas,
@@ -1392,9 +1618,9 @@ def process_one_utterance(
         "laal_reference_text": laal_reference_text,
         "metrics": {
             "laal_text": laal_value,
-            "laal_reference_mode": "llm_full_translation",
+            "laal_reference_mode": laal_reference_mode,
             "bleu_char": bleu_char_value,
-            "bleu_reference_mode": "llm_full_translation",
+            "bleu_reference_mode": laal_reference_mode,
             "effective_source_chunks": sum(1 for c in trajectory if str(c).strip()),
             "system_output_chars": len(system_output_text),
             "reference_chars": len(laal_reference_text.replace(" ", "")) if laal_reference_text else 0,
@@ -1492,10 +1718,11 @@ def main() -> None:
         print("Start it first:  bash test_instruct_serve.sh")
         sys.exit(1)
 
-    # Load word-alignment model (CPU, ~400 MB)
-    print("[Align] Loading awesome-align model ...")
+    # Load word-alignment model first (so vLLM can account for its memory when base shares GPU)
+    print(f"[Align] Loading awesome-align model on {getattr(args, 'align_device', 'cuda:0')} ...")
     align_model, align_tokenizer = load_align_model(
         cache_dir=os.environ.get("HF_HOME"),
+        device=getattr(args, "align_device", "cuda:0"),
     )
     print("[Align] Model loaded.")
 
@@ -1507,17 +1734,39 @@ def main() -> None:
     )
     print("[Instruct] Tokenizer loaded.")
 
-    # Load base model
+    # Load base model (4B fits on one card; leave headroom if align is on same GPU)
     print(f"[Base] Loading {args.base_model_path} (TP={args.tp}) ...")
     base_llm = LLM(
         model=args.base_model_path,
         dtype="auto",
         tensor_parallel_size=args.tp,
         max_model_len=4096,
-        gpu_memory_utilization=0.90,
+        gpu_memory_utilization=getattr(args, "gpu_memory_utilization", 0.85),
         enforce_eager=True,
     )
     print("[Base] Model loaded.")
+
+    # Load pre-computed translation cache (utt_id -> llm_full_translation)
+    translation_cache: Dict[str, str] = {}
+    if args.translation_cache_dir:
+        import glob as _glob
+        jsonl_files = sorted(_glob.glob(os.path.join(args.translation_cache_dir, "task_*.jsonl")))
+        print(f"[Cache] Loading translation cache from {args.translation_cache_dir} ({len(jsonl_files)} files) ...")
+        for jf in jsonl_files:
+            with open(jf, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                        uid = str(entry.get("utt_id", "")).strip()
+                        tl = entry.get("llm_full_translation", "")
+                        if uid and tl:
+                            translation_cache[uid] = tl
+                    except Exception:
+                        pass
+        print(f"[Cache] Loaded {len(translation_cache)} entries.")
 
     # Resolve rows
     if getattr(args, "test_one", False):
@@ -1550,26 +1799,32 @@ def main() -> None:
     )
 
     use_tee = getattr(args, "test_one", False)
-    written = skipped = failed = processed = 0
+
+    # Initialise base_llm lock for parallel utterance processing.
+    global _base_llm_lock
+    if args.parallel_utterances > 1:
+        _base_llm_lock = threading.Lock()
+        print(f"[Parallel] {args.parallel_utterances} concurrent utterances; "
+              f"base_llm.generate() serialised via lock.")
+
+    written = skipped = failed = 0
+    _counter_lock = threading.Lock()
     pbar = tqdm(total=total, desc=f"task_{args.task_id}")
 
-    for row_idx, row in row_iter:
-        if args.max_rows is not None and processed >= args.max_rows:
-            break
-        processed += 1
-
+    # ----------------------------------------------------------------
+    # Per-row worker: runs in thread pool or inline.
+    # Returns ("skipped"|"ok"|"error", utt_id, payload, out_path)
+    # ----------------------------------------------------------------
+    def _do_one_row(row_idx_row):
+        row_idx, row = row_idx_row
         utt_id = str(row.get(args.id_column, "")).strip()
         if not utt_id:
             utt_id = f"row_{row_idx:09d}"
-
         out_path = os.path.join(
             args.output_root, f"{sanitize_filename(utt_id)}.json"
         )
         if os.path.exists(out_path) and not args.overwrite and not args.verbose:
-            skipped += 1
-            pbar.update(1)
-            continue
-
+            return "skipped", utt_id, None, out_path
         try:
             sentences = parse_list_column(row.get("src_text_full"))
             trajectory = parse_list_column(row.get("src_trajectory"))
@@ -1577,9 +1832,7 @@ def main() -> None:
                 raise ValueError("Empty src_text_full")
             if not trajectory:
                 raise ValueError("Empty src_trajectory")
-
             verbose_log_file = None
-            verbose_log_path = None
             if args.verbose:
                 verbose_log_path = os.path.join(
                     args.output_root,
@@ -1587,7 +1840,6 @@ def main() -> None:
                 )
                 raw_file = open(verbose_log_path, "w", encoding="utf-8")
                 verbose_log_file = _TeeWriter(raw_file) if use_tee else raw_file
-
             try:
                 result = process_one_utterance(
                     base_llm, api_base, instruct_model,
@@ -1595,26 +1847,81 @@ def main() -> None:
                     align_model, align_tokenizer,
                     utt_id, sentences, trajectory, row, args,
                     verbose_log_file=verbose_log_file,
+                    translation_cache=translation_cache,
                 )
             finally:
                 if verbose_log_file is not None:
                     verbose_log_file.close()
+            return "ok", utt_id, result, out_path
+        except Exception as e:
+            return "error", utt_id, e, out_path
 
+    # ----------------------------------------------------------------
+    # Result handler (called from main thread after future completes).
+    # ----------------------------------------------------------------
+    def _handle_result(action, utt_id, payload, out_path):
+        nonlocal written, skipped, failed
+        if action == "skipped":
+            with _counter_lock:
+                skipped += 1
+        elif action == "ok":
+            result = payload
             if not (args.verbose and not args.overwrite and os.path.exists(out_path)):
                 with open(out_path, "w", encoding="utf-8") as f:
                     json.dump(result, f, ensure_ascii=False, indent=2)
-                written += 1
+                with _counter_lock:
+                    written += 1
             else:
-                skipped += 1
-
-        except Exception as e:
-            failed += 1
+                with _counter_lock:
+                    skipped += 1
+        else:  # "error"
+            e = payload
             with open(out_path, "w", encoding="utf-8") as f:
-                json.dump({
-                    "utt_id": utt_id, "error": str(e), "row_index": row_idx,
-                }, f, ensure_ascii=False, indent=2)
-
+                json.dump({"utt_id": utt_id, "error": str(e)}, f,
+                          ensure_ascii=False, indent=2)
+            with _counter_lock:
+                failed += 1
         pbar.update(1)
+
+    # ----------------------------------------------------------------
+    # Main dispatch: sequential or thread pool.
+    # ----------------------------------------------------------------
+    if args.parallel_utterances <= 1:
+        # Sequential (original behaviour, zero overhead).
+        submitted = 0
+        for row_idx, row in row_iter:
+            if args.max_rows is not None and submitted >= args.max_rows:
+                break
+            submitted += 1
+            _handle_result(*_do_one_row((row_idx, row)))
+    else:
+        # Parallel: bounded sliding window over the row generator so we never
+        # load the whole dataset into memory.
+        N = args.parallel_utterances
+        submitted = 0
+        row_source = iter(row_iter)
+        in_flight: set = set()
+
+        with ThreadPoolExecutor(max_workers=N) as pool:
+            def _fill():
+                nonlocal submitted
+                while len(in_flight) < N * 3:
+                    if args.max_rows is not None and submitted >= args.max_rows:
+                        break
+                    try:
+                        ri, r = next(row_source)
+                        submitted += 1
+                        in_flight.add(pool.submit(_do_one_row, (ri, r)))
+                    except StopIteration:
+                        break
+
+            _fill()  # seed the pool
+            while in_flight:
+                done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+                for fut in done:
+                    in_flight.discard(fut)
+                    _handle_result(*fut.result())
+                _fill()  # refill to keep pool busy
 
     pbar.close()
     print(

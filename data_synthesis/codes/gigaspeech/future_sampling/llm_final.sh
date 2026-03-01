@@ -2,12 +2,21 @@
 # ============================================================
 # Future Sampling (Final) -- Dual-model pipeline
 #
-# GPU layout (per node, 2 GPUs):
+# GPU layout (per task, 2 GPUs):
 #   GPU 0: Base model  (Qwen3-30B-A3B-FP8) in-process llm.generate()
-#   GPU 1: Instruct model (vllm serve on port 8100)
+#          + awesome-align BERT (small, shares GPU 0)
+#   GPU 1: Instruct model (vllm serve on port 8100+TASK_ID)
 #
-# Trial: NUM_TASKS=1 MAX_ROWS=5 sbatch --array=0 llm_final.sh
-# Full:  sbatch llm_final.sh
+# Each task needs 2 GPUs.  8 GPUs → 4 tasks in parallel.
+#
+# Trial  (1 task, 5 rows):
+#   NUM_TASKS=1 MAX_ROWS=5 sbatch --array=0 llm_final.sh
+#
+# 100 cases, 8 GPUs (4 tasks × 2 GPUs, 3 parallel utterances each):
+#   NUM_TASKS=4 MAX_ROWS=100 sbatch --array=0-3 llm_final.sh
+#
+# Full dataset, 8 GPUs:
+#   NUM_TASKS=4 sbatch --array=0-3 llm_final.sh
 # ============================================================
 #SBATCH --job-name=giga_fut_final
 #SBATCH --nodes=1
@@ -34,19 +43,26 @@ OUT_ROOT="/data/user_data/haolingp/data_synthesis/outputs/gigaspeech/train_xl_fu
 
 BASE_MODEL="${BASE_MODEL:-/data/user_data/haolingp/models/Qwen3-30B-A3B-FP8}"
 INSTRUCT_MODEL="${INSTRUCT_MODEL:-/data/user_data/haolingp/models/Qwen3-30B-A3B-Instruct-2507-FP8}"
-INSTRUCT_PORT=8100
 NUM_TASKS="${NUM_TASKS:-8}"
 MAX_ROWS="${MAX_ROWS:-}"
 
 NUM_CANDIDATES="${NUM_CANDIDATES:-10}"
 FUTURE_TOKENS="${FUTURE_TOKENS:-30}"
 SAMPLE_TEMP="${SAMPLE_TEMP:-0.8}"
+PARALLEL_UTTERANCES="${PARALLEL_UTTERANCES:-3}"
+
+TRANSLATION_CACHE_DIR="${TRANSLATION_CACHE_DIR:-/data/user_data/haolingp/data_synthesis/outputs/gigaspeech/llm_full_translation_cache/train_xl_case_robust_asr_filtered}"
+
+# Port is offset by task ID so multiple tasks on the same node don't collide.
+INSTRUCT_PORT=$((8100 + SLURM_ARRAY_TASK_ID))
 
 EXTRA_ARGS=()
 if [[ -n "${MAX_ROWS}" ]]; then
   EXTRA_ARGS+=(--max-rows "${MAX_ROWS}")
 fi
 [[ -n "${OVERWRITE:-}" ]] && [[ "${OVERWRITE}" != "0" ]] && EXTRA_ARGS+=(--overwrite)
+[[ -n "${TRANSLATION_CACHE_DIR}" ]] && EXTRA_ARGS+=(--translation-cache-dir "${TRANSLATION_CACHE_DIR}")
+EXTRA_ARGS+=(--parallel-utterances "${PARALLEL_UTTERANCES}")
 
 mkdir -p "$(dirname "${OUT_ROOT}")"/slurm_logs
 mkdir -p "${OUT_ROOT}"
