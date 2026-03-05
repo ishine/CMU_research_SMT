@@ -83,7 +83,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--gpu-memory-utilization", type=float, default=0.85,
                    help="vLLM GPU memory fraction for base model. Use 0.80-0.85 when align model shares the same GPU.")
     p.add_argument("--align-device", default="cuda:0",
-                   help="Device for awesome-align (e.g. cuda:0 to share with base for speed; use cpu if OOM).")
+                   help="Device for align model (e.g. cuda:0 to share with base; use cpu if OOM).")
+    p.add_argument("--align-method", choices=["awesome_align", "simalign"], default="awesome_align",
+                   help="Word alignment: awesome_align (default) or simalign+monotonic (core_v2).")
 
     p.add_argument("--task-id", type=int, default=0)
     p.add_argument("--num-tasks", type=int, default=1)
@@ -706,6 +708,12 @@ _MAX_TGT_CHARS_PER_OBS_WORD = 5
 _ALIGNMENT_SPREAD_THRESHOLD = 12
 # Truncation at very end (t_idx > len(translation)-this) → likely sentence-end attraction, use fallback.
 _ALIGNMENT_VERY_END_MARGIN = 3
+# Last word aligned to very early position (t_idx < this) → likely wrong, use fallback to avoid over/under truncate.
+_ALIGNMENT_TOO_EARLY_THRESHOLD = 2
+
+# Sentence-scoped alignment gates
+_SENTENCE_COVERAGE_GATE = 0.75
+_BAD_LAST_WORDS = frozenset({"am", "is", "are", "was", "were", "be", "been", "being"})
 
 
 def truncate_by_alignment(full_src: str, observed_src: str, translation: str, alignments):
@@ -741,7 +749,7 @@ def truncate_by_alignment(full_src: str, observed_src: str, translation: str, al
         safe_chars = int(len(translation) * ratio * 0.8)
         return translation[:safe_chars] if safe_chars >= 2 else ""
 
-    # Last observed word aligned: use median(last_t) unless spread or very-end makes it unreliable.
+    # Last observed word aligned: use median(last_t) unless spread, very-end, or too-early makes it unreliable.
     if last_t:
         spread = max(last_t) - min(last_t)
         if spread > _ALIGNMENT_SPREAD_THRESHOLD:
@@ -749,6 +757,10 @@ def truncate_by_alignment(full_src: str, observed_src: str, translation: str, al
             return out
         t_idx = sorted(last_t)[len(last_t) // 2]
         if t_idx > len(translation) - _ALIGNMENT_VERY_END_MARGIN:
+            out = _fallback_safe_tgt_idx() or _fallback_ratio()
+            return out
+        # Last word mapped to very early position (e.g. "both" -> "而") → alignment noise, avoid under-truncate
+        if t_idx < _ALIGNMENT_TOO_EARLY_THRESHOLD:
             out = _fallback_safe_tgt_idx() or _fallback_ratio()
             return out
         raw_len = t_idx + 1
@@ -1256,6 +1268,27 @@ def _build_translation_prompt_text(
     return text
 
 
+def _build_sentence_translation_prompt_text(tokenizer: Any, observed_source: str) -> str:
+    """Build prompt for translating a single sentence: Chinese only, no explanation, keep terminology consistent."""
+    messages = [{
+        "role": "user",
+        "content": (
+            "[TASK]\n"
+            "Translate the [INPUT] sentence into Chinese. "
+            "Output ONLY the Chinese translation, no explanation. "
+            "Keep terminology consistent across sentences.\n\n"
+            f"[INPUT]\n{observed_source}"
+        ),
+    }]
+    text = tokenizer.apply_chat_template(
+        messages,
+        add_generation_prompt=False,
+        tokenize=False,
+    )
+    text += "<|im_start|>assistant\n"
+    return text
+
+
 def _build_continue_prompt(full_source: str, committed: str) -> str:
     """Prompt that asks the model to continue translating from committed."""
     if not committed:
@@ -1288,14 +1321,18 @@ async def _translate_batch_async(
     instruct_tokenizer,
     sources: List[str],
     committed: str = "",
+    use_sentence_prompt: bool = False,
 ) -> List[str]:
     """Translate a batch of sources concurrently, continuing from committed."""
     async def _one(src: str) -> str:
-        prompt_text = _build_translation_prompt_text(
-            instruct_tokenizer,
-            observed_source=src,
-            committed=committed,
-        )
+        if use_sentence_prompt:
+            prompt_text = _build_sentence_translation_prompt_text(instruct_tokenizer, observed_source=src)
+        else:
+            prompt_text = _build_translation_prompt_text(
+                instruct_tokenizer,
+                observed_source=src,
+                committed=committed,
+            )
         resp = await client.completions.create(
             model=model,
             prompt=prompt_text,
@@ -1316,12 +1353,14 @@ async def _translate_batch_with_client_async(
     instruct_tokenizer,
     sources: List[str],
     committed: str = "",
+    use_sentence_prompt: bool = False,
 ) -> List[str]:
     """Create/use/close AsyncOpenAI client inside one event loop."""
     client = _make_async_client(api_base)
     try:
         return await _translate_batch_async(
-            client, model, instruct_tokenizer, sources, committed
+            client, model, instruct_tokenizer, sources, committed,
+            use_sentence_prompt=use_sentence_prompt,
         )
     finally:
         # Ensure httpx AsyncClient closes before asyncio.run tears down the loop.
@@ -1885,6 +1924,82 @@ def get_semantic_merge_delta_via_llm(
 
 
 # ===================================================================
+# Sentence-scoped alignment: precompute translations & chunk→sentence map
+# ===================================================================
+
+def precompute_sentence_translations(
+    api_base: str,
+    model: str,
+    instruct_tokenizer,
+    sentences: List[str],
+    verbose_log_file: Optional[Any] = None,
+) -> List[str]:
+    """Translate each sentence independently. Uses committed=\"\" always.
+    Prompt: output Chinese only, no explanation, keep terminology consistent across sentences.
+    Call once at start of process_one_utterance before chunk loop.
+    """
+    if not sentences:
+        return []
+    raw_list = asyncio.run(
+        _translate_batch_with_client_async(
+            api_base, model, instruct_tokenizer, sentences, committed="",
+            use_sentence_prompt=True,
+        )
+    )
+    out = []
+    for i, raw in enumerate(raw_list):
+        cleaned = normalize_zh(clean_translation_for_alignment(raw or ""))
+        out.append(cleaned)
+    if verbose_log_file is not None:
+        _vlog(verbose_log_file, "[precompute_sentence_translations] per-sentence translations:")
+        for i, t in enumerate(out):
+            _vlog(verbose_log_file, f"  sent[{i}]: \"{t}\"")
+    return out
+
+
+def build_chunk_to_sentence_map(
+    sentences: List[str],
+    trajectory: List[str],
+) -> Tuple[List[int], List[int], List[int]]:
+    """Compute chunk_sentence_ids and sent_word_start / sent_word_end.
+
+    sent_word_start[i] = cumulative word count before sentence i.
+    sent_word_end[i] = sent_word_start[i] + word_count(sentences[i]).
+    For each chunk: if 0 words, map to previous non-empty chunk's sentence (or 0).
+    Else: after adding chunk words to obs_word_count, set sid = smallest i with obs_word_count <= sent_word_end[i].
+    Returns (chunk_sentence_ids, sent_word_start, sent_word_end).
+    """
+    n_sent = len(sentences)
+    sent_word_start: List[int] = [0]
+    for s in sentences:
+        sent_word_start.append(sent_word_start[-1] + len(s.strip().split()))
+    sent_word_end = sent_word_start[1:]
+    sent_word_start = sent_word_start[:-1]
+    if n_sent == 0:
+        return [], [], []
+
+    chunk_sentence_ids: List[int] = []
+    obs_word_count = 0
+    last_nonempty_sid = 0
+    for chunk in trajectory:
+        words_in_chunk = len(chunk.strip().split()) if chunk.strip() else 0
+        if words_in_chunk == 0:
+            chunk_sentence_ids.append(last_nonempty_sid)
+            continue
+        obs_word_count += words_in_chunk
+        sid = 0
+        for i in range(n_sent):
+            if obs_word_count <= sent_word_end[i]:
+                sid = i
+                break
+        else:
+            sid = n_sent - 1
+        last_nonempty_sid = sid
+        chunk_sentence_ids.append(sid)
+    return chunk_sentence_ids, sent_word_start, sent_word_end
+
+
+# ===================================================================
 # Core Processing
 # ===================================================================
 
@@ -1922,6 +2037,26 @@ def process_one_utterance(
     _vlog(verbose_log_file, f"# Chunks: {n_chunks}")
     _vlog(verbose_log_file, f"# M={args.num_candidates}")
     _vlog(verbose_log_file, f"{'#'*60}")
+
+    # Sentence-scoped alignment: precompute per-sentence translations and chunk→sentence map
+    sentence_translations: List[str] = []
+    chunk_sentence_ids: List[int] = []
+    sent_word_start: List[int] = []
+    sent_word_end: List[int] = []
+    committed_sentence_prefix_lens: List[int] = []
+    if sentences:
+        sentence_translations = precompute_sentence_translations(
+            api_base, instruct_model, instruct_tokenizer, sentences, verbose_log_file
+        )
+        chunk_sentence_ids, sent_word_start, sent_word_end = build_chunk_to_sentence_map(
+            sentences, trajectory
+        )
+        committed_sentence_prefix_lens = [0] * len(sentences)
+        total_sent_words = sum(len(s.strip().split()) for s in sentences)
+        total_traj_words = sum(len(c.strip().split()) for c in trajectory if c.strip())
+        if abs(total_sent_words - total_traj_words) > 3:
+            _vlog(verbose_log_file,
+                  f"  [WARN] sentence word count ({total_sent_words}) != trajectory word count ({total_traj_words}), sentence path may misalign")
 
     committed_norm = ""
     accumulated_source = ""
@@ -2050,92 +2185,211 @@ def process_one_utterance(
             _vlog(verbose_log_file, f"    {ti}: \"{t}\"")
 
         # Step 3: Alignment-truncate all candidates.
-        # We align on local windows around the observed/future boundary to
-        # reduce long-context drift, then map truncation back to full translation.
+        # Sentence-scoped path: align once per chunk to precomputed sentence translation; fallback to windowed path on failure.
         t3_0 = time.perf_counter()
         t3_truncate_sum = 0.0
+        t3_align_model_sum = 0.0
         candidate_infos: List[Dict[str, Any]] = []
+        current_sent_idx_ctx: Optional[int] = None
+        local_obs_src_ctx = ""
+        sent_translation_ctx = ""
+        use_sentence_path = bool(sentence_translations and chunk_sentence_ids and chunk_pos < len(chunk_sentence_ids))
+        if use_sentence_path:
+            current_sent_idx_ctx = chunk_sentence_ids[chunk_pos]
+            all_obs_words = accumulated_source.strip().split()
+            i = current_sent_idx_ctx
+            start_w = sent_word_start[i] if i < len(sent_word_start) else 0
+            end_w = min(len(all_obs_words), sent_word_end[i]) if i < len(sent_word_end) else len(all_obs_words)
+            local_obs_words = all_obs_words[start_w:end_w]
+            local_obs_src_ctx = " ".join(local_obs_words).strip()
+            if not local_obs_src_ctx and all_obs_words:
+                local_obs_src_ctx = all_obs_words[-1]
+            sent_translation_sent = sentence_translations[current_sent_idx_ctx] if current_sent_idx_ctx < len(sentence_translations) else ""
+            sent_translation_ctx = sent_translation_sent
 
-        full_srcs = [
-            (accumulated_source + " " + future).strip() if future else accumulated_source
-            for future in futures
-        ]
-        local_views: List[Tuple[str, str, str, int]] = []
-        alignment_pairs: List[Tuple[str, str]] = []
-        for full_src_for_candidate, translation in zip(full_srcs, all_translations):
-            local_full_src, local_observed_src, local_translation, tgt_offset = build_local_alignment_windows(
-                full_src_for_candidate,
-                accumulated_source,
-                translation,
-                committed_norm,
+            # Gate A: coverage — only use sentence path when sentence is almost complete
+            sent_total_words = len(sentences[current_sent_idx_ctx].strip().split()) if current_sent_idx_ctx < len(sentences) else 1
+            local_obs_count_for_gate = len(local_obs_src_ctx.strip().split()) if local_obs_src_ctx.strip() else 0
+            coverage = local_obs_count_for_gate / max(1, sent_total_words)
+            # Gate B: be-verb stoplist — last observed word is too ambiguous for alignment
+            last_word = local_obs_src_ctx.strip().split()[-1].lower() if local_obs_src_ctx.strip() else ""
+            if coverage < _SENTENCE_COVERAGE_GATE:
+                _vlog(verbose_log_file, f"  [Step 3 sentence-scoped] SKIP: coverage={coverage:.2f} < {_SENTENCE_COVERAGE_GATE} (sent_idx={current_sent_idx_ctx})")
+                use_sentence_path = False
+            elif last_word in _BAD_LAST_WORDS:
+                _vlog(verbose_log_file, f"  [Step 3 sentence-scoped] SKIP: last_word=\"{last_word}\" in be-verb stoplist (sent_idx={current_sent_idx_ctx})")
+                use_sentence_path = False
+
+        if use_sentence_path:
+            sent_translation_log = (sent_translation_sent[:80] + "…") if len(sent_translation_sent) > 80 else sent_translation_sent
+            _vlog(verbose_log_file, f"  [Step 3 sentence-scoped] current_sent_idx={current_sent_idx_ctx} local_obs_src=\"{local_obs_src_ctx}\" sent_translation=\"{sent_translation_log}\" coverage={coverage:.2f}")
+
+            t3a_0 = time.perf_counter()
+            alignments_sent = get_word_alignments(
+                local_obs_src_ctx, sent_translation_sent, align_model, align_tokenizer
             )
-            local_views.append((local_full_src, local_observed_src, local_translation, tgt_offset))
-            # Align only observed source to translation so we find where "observed" ends in target.
-            # Using full_src would align many words to few chars and can wrongly map the last
-            # observed word to the end of the sentence (e.g. "these" -> "。").
-            alignment_pairs.append((local_observed_src, local_translation))
-
-        t3a_0 = time.perf_counter()
-        batch_alignments = get_word_alignments_batch(
-            alignment_pairs,
-            align_model, align_tokenizer,
-        )
-        t3_align_model_sum = time.perf_counter() - t3a_0
-
-        for ci, (future, translation, full_src_for_candidate, alignments, local_view) in enumerate(
-            zip(futures, all_translations, full_srcs, batch_alignments, local_views)
-        ):
-            local_full_src, local_observed_src, local_translation, tgt_offset = local_view
+            t3_align_model_sum = time.perf_counter() - t3a_0
+            full_src_sent = sentences[current_sent_idx_ctx] if current_sent_idx_ctx < len(sentences) else local_obs_src_ctx
             t3b_0 = time.perf_counter()
-            local_safe_prefix = truncate_by_alignment(
-                local_full_src, local_observed_src,
-                local_translation, alignments,
+            local_safe_prefix_sent = truncate_by_alignment(
+                full_src_sent, local_obs_src_ctx, sent_translation_sent, alignments_sent
             )
-            safe_end = max(0, min(len(translation), tgt_offset + len(local_safe_prefix)))
-            safe_prefix = translation[:safe_end]
-            # Never let truncation roll back already committed content.
-            if committed_norm and translation.startswith(committed_norm) and len(safe_prefix) < len(committed_norm):
-                safe_prefix = committed_norm
-            t3_truncate_sum += (time.perf_counter() - t3b_0)
+            t3_truncate_sum = time.perf_counter() - t3b_0
+            already = committed_sentence_prefix_lens[current_sent_idx_ctx] if current_sent_idx_ctx < len(committed_sentence_prefix_lens) else 0
+            new_in_sent = local_safe_prefix_sent[already:] if len(local_safe_prefix_sent) > already else ""
+            _vlog(verbose_log_file,
+                  f"  [Step 3 sentence] local_safe_prefix_sent=\"{local_safe_prefix_sent[:60]}{'…' if len(local_safe_prefix_sent) > 60 else ''}\" already={already} new_in_sent_len={len(new_in_sent)}")
 
-            # 是否以已经提交的译文 committed_norm 开头
-            monotonic_ok = (not committed_norm) or safe_prefix.startswith(committed_norm)
-            delta = ""
-            if monotonic_ok and safe_prefix and len(safe_prefix) > len(committed_norm):
-                delta = safe_prefix[len(committed_norm):]  # 比已提交内容更长时，才取新增部分
-            length_ok = len(delta) >= args.min_commit_chars
-
-            # Guard B: require alignment for the last observed word; stricter quality checks
-            local_obs_count = len(local_observed_src.strip().split()) if local_observed_src.strip() else 0
-            if local_obs_count > 0:
-                need_src_idx = local_obs_count - 1
-                has_last_word_alignment = any(s_idx == need_src_idx for s_idx, _ in alignments)
-                if not has_last_word_alignment:
-                    delta = ""
-                    length_ok = False
+            local_obs_count_sent = len(local_obs_src_ctx.strip().split()) if local_obs_src_ctx.strip() else 0
+            alignment_ok = True
+            if local_obs_count_sent > 0:
+                need_src_idx = local_obs_count_sent - 1
+                has_last = any(s_idx == need_src_idx for s_idx, _ in alignments_sent)
+                if not has_last:
+                    alignment_ok = False
                 else:
-                    last_t = [t for s, t in alignments if s == need_src_idx]
+                    last_t = [t for s, t in alignments_sent if s == need_src_idx]
                     if last_t:
                         spread = max(last_t) - min(last_t)
                         t_idx_used = sorted(last_t)[len(last_t) // 2]
-                        if spread > _ALIGNMENT_SPREAD_THRESHOLD:
-                            delta = ""
-                            length_ok = False
-                        elif t_idx_used > len(local_translation) - _ALIGNMENT_VERY_END_MARGIN:
-                            delta = ""
-                            length_ok = False
+                        if spread > _ALIGNMENT_SPREAD_THRESHOLD or t_idx_used > len(sent_translation_sent) - _ALIGNMENT_VERY_END_MARGIN:
+                            alignment_ok = False
 
-            candidate_infos.append({
-                "idx": ci,
-                "future": future,
-                "translation": translation,
-                "full_src_for_candidate": full_src_for_candidate,
-                "alignments": [(s, t) for s, t in alignments],
-                "safe_prefix": safe_prefix,
-                "delta": delta,
-                "monotonic_ok": monotonic_ok,
-                "length_ok": length_ok,
-            })
+            length_ok_sent = len(new_in_sent) >= args.min_commit_chars
+            if alignment_ok and length_ok_sent:
+                # Sentence path success: directly WRITE/READ and skip Step 4.
+                new_chars = strip_committed_suffix_from_delta(committed_norm, new_in_sent)
+                risky = _ends_on_word_head(new_chars)
+                t3 = time.perf_counter() - t3_0
+                timing_totals["step3_alignment_total_s"] += t3
+                timing_totals["step3_alignment_model_s"] += t3_align_model_sum
+                timing_totals["step3_truncate_s"] += t3_truncate_sum
+                if len(new_chars) >= args.min_commit_chars and not risky:
+                    committed_norm = committed_norm + new_chars
+                    decisions.append(("WRITE", new_chars))
+                    if sentence_translations and chunk_sentence_ids and chunk_pos < len(chunk_sentence_ids):
+                        sid = chunk_sentence_ids[chunk_pos]
+                        if sid < len(committed_sentence_prefix_lens):
+                            prefix_before = "".join(sentence_translations[:sid])
+                            chars_in_sent = len(committed_norm) - len(prefix_before)
+                            committed_sentence_prefix_lens[sid] = max(
+                                committed_sentence_prefix_lens[sid],
+                                max(0, chars_in_sent),
+                            )
+                    _vlog(verbose_log_file,
+                          f"  -> WRITE (sentence-path) \"{new_chars}\"  committed=\"{committed_norm}\"")
+                else:
+                    decisions.append(("READ", ""))
+                    if risky:
+                        _vlog(verbose_log_file,
+                              f"  -> READ (sentence-path word_head_guard: ends on '{new_chars[-1] if new_chars else ''}')")
+                    else:
+                        _vlog(verbose_log_file,
+                              f"  -> READ (sentence-path new_chars len={len(new_chars)} < min={args.min_commit_chars})")
+                chunk_elapsed = time.perf_counter() - chunk_t0
+                timing_totals["chunk_total_s"] += chunk_elapsed
+                _vlog(verbose_log_file,
+                      f"  [Timing] step1={t1:.3f}s step2={t2:.3f}s step3={t3:.3f}s chunk_total={chunk_elapsed:.3f}s (sentence-path)")
+                if args.save_details:
+                    all_details.append({
+                        "observed": accumulated_source,
+                        "futures": futures,
+                        "translations": all_translations,
+                        "new_chars": new_chars if decisions[-1][0] == "WRITE" else "",
+                        "committed_after": committed_norm,
+                        "action": decisions[-1][0],
+                        "current_sent_idx": current_sent_idx_ctx,
+                        "local_obs_src": local_obs_src_ctx,
+                        "sent_translation": sent_translation_ctx,
+                        "reason": "sentence_path",
+                    })
+                continue
+            else:
+                _vlog(verbose_log_file, f"  [Step 3 sentence] alignment_ok={alignment_ok} length_ok={length_ok_sent} -> fallback to windowed path")
+                use_sentence_path = False
+
+        if not use_sentence_path:
+            # Fallback: original windowed alignment (build_local_alignment_windows, batch align per candidate)
+            full_srcs = [
+                (accumulated_source + " " + future).strip() if future else accumulated_source
+                for future in futures
+            ]
+            local_views: List[Tuple[str, str, str, int]] = []
+            alignment_pairs: List[Tuple[str, str]] = []
+            for full_src_for_candidate, translation in zip(full_srcs, all_translations):
+                local_full_src, local_observed_src, local_translation, tgt_offset = build_local_alignment_windows(
+                    full_src_for_candidate,
+                    accumulated_source,
+                    translation,
+                    committed_norm,
+                )
+                local_views.append((local_full_src, local_observed_src, local_translation, tgt_offset))
+                alignment_pairs.append((local_observed_src, local_translation))
+
+            t3a_0 = time.perf_counter()
+            batch_alignments = get_word_alignments_batch(
+                alignment_pairs,
+                align_model, align_tokenizer,
+            )
+            t3_align_model_sum += time.perf_counter() - t3a_0
+
+            for ci, (future, translation, full_src_for_candidate, alignments, local_view) in enumerate(
+                zip(futures, all_translations, full_srcs, batch_alignments, local_views)
+            ):
+                local_full_src, local_observed_src, local_translation, tgt_offset = local_view
+                t3b_0 = time.perf_counter()
+                local_safe_prefix = truncate_by_alignment(
+                    local_full_src, local_observed_src,
+                    local_translation, alignments,
+                )
+                safe_end = max(0, min(len(translation), tgt_offset + len(local_safe_prefix)))
+                safe_prefix = translation[:safe_end]
+                if committed_norm and translation.startswith(committed_norm) and len(safe_prefix) < len(committed_norm):
+                    safe_prefix = committed_norm
+                # Cap by current sentence precomputed length so fallback never over-translates past sent_translation
+                if sentence_translations and current_sent_idx_ctx is not None and current_sent_idx_ctx < len(sentence_translations):
+                    prefix_before = "".join(sentence_translations[:current_sent_idx_ctx])
+                    max_total_len = len(prefix_before) + len(sentence_translations[current_sent_idx_ctx])
+                    if max_total_len >= len(committed_norm) and len(safe_prefix) > max_total_len:
+                        safe_prefix = safe_prefix[:max_total_len]
+                t3_truncate_sum += (time.perf_counter() - t3b_0)
+
+                monotonic_ok = (not committed_norm) or safe_prefix.startswith(committed_norm)
+                delta = ""
+                if monotonic_ok and safe_prefix and len(safe_prefix) > len(committed_norm):
+                    delta = safe_prefix[len(committed_norm):]
+                length_ok = len(delta) >= args.min_commit_chars
+
+                local_obs_count = len(local_observed_src.strip().split()) if local_observed_src.strip() else 0
+                if local_obs_count > 0:
+                    need_src_idx = local_obs_count - 1
+                    has_last_word_alignment = any(s_idx == need_src_idx for s_idx, _ in alignments)
+                    if not has_last_word_alignment:
+                        delta = ""
+                        length_ok = False
+                    else:
+                        last_t = [t for s, t in alignments if s == need_src_idx]
+                        if last_t:
+                            spread = max(last_t) - min(last_t)
+                            t_idx_used = sorted(last_t)[len(last_t) // 2]
+                            if spread > _ALIGNMENT_SPREAD_THRESHOLD:
+                                delta = ""
+                                length_ok = False
+                            elif t_idx_used > len(local_translation) - _ALIGNMENT_VERY_END_MARGIN:
+                                delta = ""
+                                length_ok = False
+
+                candidate_infos.append({
+                    "idx": ci,
+                    "future": future,
+                    "translation": translation,
+                    "full_src_for_candidate": full_src_for_candidate,
+                    "alignments": [(s, t) for s, t in alignments],
+                    "safe_prefix": safe_prefix,
+                    "delta": delta,
+                    "monotonic_ok": monotonic_ok,
+                    "length_ok": length_ok,
+                })
         t3 = time.perf_counter() - t3_0
         timing_totals["step3_alignment_total_s"] += t3
         timing_totals["step3_alignment_model_s"] += t3_align_model_sum
@@ -2162,14 +2416,19 @@ def process_one_utterance(
             _vlog(verbose_log_file,
                   f"  [Timing] chunk_total={chunk_elapsed:.3f}s (no_valid_truncated_candidate)")
             if args.save_details:
-                all_details.append({
+                d = {
                     "observed": accumulated_source,
                     "futures": futures,
                     "translations": all_translations,
                     "candidates": candidate_infos,
                     "reason": "no_valid_truncated_candidate",
                     "action": "READ",
-                })
+                }
+                if current_sent_idx_ctx is not None:
+                    d["current_sent_idx"] = current_sent_idx_ctx
+                    d["local_obs_src"] = local_obs_src_ctx
+                    d["sent_translation"] = sent_translation_ctx
+                all_details.append(d)
             continue
 
         new_chars = ""
@@ -2179,14 +2438,43 @@ def process_one_utterance(
         selection_mode = getattr(args, "selection_mode", "majority_vote")
         t4_0 = time.perf_counter()
         if selection_mode == "lcp_code":
-            new_chars = get_quorum_lcp_delta_code(
-                committed_norm, candidate_safe_prefixes, consensus_ratio=1.0
-            )
+            # Require >=2 agreeing candidates; single-candidate commit is fragile (wrong delta can poison rest).
+            if len(valid_candidates) < 2:
+                new_chars = ""
+                _vlog(verbose_log_file, f"  [Step 4] fewer than 2 valid candidates, READ.")
+            else:
+                deltas_for_check = [c["delta"] for c in valid_candidates if c.get("delta")]
+                if len(deltas_for_check) < 2:
+                    new_chars = ""
+                    _vlog(verbose_log_file, f"  [Step 4] too few deltas for direction check, READ.")
+                else:
+                    is_consistent, dir_info = check_direction(deltas_for_check, n=3, min_ratio=0.35)
+                    if not is_consistent:
+                        new_chars = ""
+                        _vlog(verbose_log_file, f"  [Step 4] direction inconsistent, READ. {dir_info}")
+                    else:
+                        new_chars = get_quorum_lcp_delta_code(
+                            committed_norm, candidate_safe_prefixes, consensus_ratio=1.0
+                        )
             step4_tag = "LCPCode100"
         elif selection_mode == "lcp70_code":
-            new_chars = get_quorum_lcp_delta_code(
-                committed_norm, candidate_safe_prefixes, consensus_ratio=args.consensus_ratio
-            )
+            if len(valid_candidates) < 2:
+                new_chars = ""
+                _vlog(verbose_log_file, f"  [Step 4] fewer than 2 valid candidates, READ.")
+            else:
+                deltas_for_check = [c["delta"] for c in valid_candidates if c.get("delta")]
+                if len(deltas_for_check) < 2:
+                    new_chars = ""
+                    _vlog(verbose_log_file, f"  [Step 4] too few deltas for direction check, READ.")
+                else:
+                    is_consistent, dir_info = check_direction(deltas_for_check, n=3, min_ratio=0.35)
+                    if not is_consistent:
+                        new_chars = ""
+                        _vlog(verbose_log_file, f"  [Step 4] direction inconsistent, READ. {dir_info}")
+                    else:
+                        new_chars = get_quorum_lcp_delta_code(
+                            committed_norm, candidate_safe_prefixes, consensus_ratio=args.consensus_ratio
+                        )
             step4_tag = f"LCPCode{int(round(args.consensus_ratio * 100))}"
         elif selection_mode == "lcp70_llm":
             new_chars = get_majority_vote_delta_via_llm(
@@ -2223,6 +2511,16 @@ def process_one_utterance(
         if len(new_chars) >= args.min_commit_chars and not risky:
             committed_norm = committed_norm + new_chars
             decisions.append(("WRITE", new_chars))
+            # Track how many chars of sent_translation are now covered by committed_norm
+            if sentence_translations and chunk_sentence_ids and chunk_pos < len(chunk_sentence_ids):
+                sid = chunk_sentence_ids[chunk_pos]
+                if sid < len(committed_sentence_prefix_lens):
+                    prefix_before = "".join(sentence_translations[:sid])
+                    chars_in_sent = len(committed_norm) - len(prefix_before)
+                    committed_sentence_prefix_lens[sid] = max(
+                        committed_sentence_prefix_lens[sid],
+                        max(0, chars_in_sent),
+                    )
             _vlog(verbose_log_file,
                   f"  -> WRITE \"{new_chars}\"  committed=\"{committed_norm}\"")
         else:
@@ -2251,6 +2549,10 @@ def process_one_utterance(
                 "action": decisions[-1][0],
             }
             detail["selection_mode"] = selection_mode
+            if current_sent_idx_ctx is not None:
+                detail["current_sent_idx"] = current_sent_idx_ctx
+                detail["local_obs_src"] = local_obs_src_ctx
+                detail["sent_translation"] = sent_translation_ctx
             all_details.append(detail)
 
     # ---- Assemble output ----
@@ -2384,6 +2686,24 @@ def get_one_row_by_id(
 def main() -> None:
     args = parse_args()
     setup_env()
+
+    # Use simalign (core_v2) if requested
+    if getattr(args, "align_method", "awesome_align") == "simalign":
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        core_v2_path = os.path.join(script_dir, "llm_future_sampling_core_v2.py")
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("llm_future_sampling_core_v2", core_v2_path)
+        core_v2 = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(core_v2)
+        global load_align_model, get_word_alignments, truncate_by_alignment
+        global get_word_alignments_batch, build_local_alignment_windows
+        load_align_model = core_v2.load_align_model
+        get_word_alignments = core_v2.get_word_alignments
+        truncate_by_alignment = core_v2.truncate_by_alignment
+        get_word_alignments_batch = core_v2.get_word_alignments_batch
+        build_local_alignment_windows = core_v2.build_local_alignment_windows
+        print("[Align] Using simalign (core_v2).")
+
     os.makedirs(args.output_root, exist_ok=True)
 
     api_base = args.instruct_api_base
@@ -2400,7 +2720,8 @@ def main() -> None:
         sys.exit(1)
 
     # Load word-alignment model first (so vLLM can account for its memory when base shares GPU)
-    print(f"[Align] Loading awesome-align model on {getattr(args, 'align_device', 'cuda:0')} ...")
+    align_dev = getattr(args, "align_device", "cuda:0")
+    print(f"[Align] Loading align model on {align_dev} ...")
     align_model, align_tokenizer = load_align_model(
         cache_dir=os.environ.get("HF_HOME"),
         device=getattr(args, "align_device", "cuda:0"),
@@ -2686,14 +3007,15 @@ if __name__ == "__main__":
 # --instruct-api-base http://localhost:8100/v1   --overwrite --future-sampling-batch-size 4 --future-sampling-
 # batch-wait 0.05
 
-# CUDA_VISIBLE_DEVICES=0 python /data/user_data/haolingp/data_synthesis/codes/gigaspeech/future_sampling/llm_future_sampling_final.py \
-#   --input-tsv /data/group_data/li_lab/siqiouya/datasets/gigaspeech/manifests/train_xl_case_robust_asr-filtered.tsv \
-#   --output-root /data/user_data/haolingp/data_synthesis/outputs/gigaspeech/train_xl_future_sampling_final/test_b1 \
-#   --task-id 0 \
-#   --num-tasks 1 \
-#   --parallel-utterance 1 \
-#   --max-rows 1 \
-#   --instruct-api-base http://localhost:8100/v1 \
-#   --overwrite \
-#   --selection-mode lcp_code
+# Run each mode (test_100):
+#   test_lcp:         llm_future_sampling_lcp_code.py     -> .../test_100/test_lcp
+#   test_lcp70:       llm_future_sampling_lcp70_code.py   -> .../test_100/test_lcp70
+#   test_lcp70_llm:   llm_future_sampling_lcp70_llm.py    -> .../test_100/test_lcp70_llm
+#   test_semantic:    llm_future_sampling_final.py        -> .../test_100/test_semantic
+#
+# CUDA_VISIBLE_DEVICES=0 python llm_future_sampling_lcp70_llm.py \
+#   --input-tsv /path/to/manifest.tsv \
+#   --output-root .../test_100/test_lcp70_llm \
+#   --utt-id AUD0000000003_0 --test-one --verbose --overwrite \
+#   --num-tasks 1 --parallel-utterances 1 --instruct-api-base http://localhost:8100/v1 --no-tee
 
