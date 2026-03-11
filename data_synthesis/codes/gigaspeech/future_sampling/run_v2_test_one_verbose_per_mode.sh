@@ -13,7 +13,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 INPUT_TSV="${1:-/data/group_data/li_lab/siqiouya/datasets/gigaspeech/manifests/train_xl_case_robust_asr-filtered.tsv}"
-OUTPUT_ROOT="${2:-/data/user_data/haolingp/data_synthesis/outputs/gigaspeech/train_xl_future_sampling_final/out_simalign_test_two}"
+OUTPUT_ROOT="${2:-/data/user_data/haolingp/data_synthesis/outputs/gigaspeech/train_xl_future_sampling_final/out_simalign_test_three}"
 MODE_FILTER="${3:-all}"
 
 if [[ ! -f "$INPUT_TSV" ]]; then

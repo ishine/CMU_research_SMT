@@ -100,7 +100,7 @@ def load_align_model(cache_dir: Optional[str] = None, device: Optional[str] = No
         f"[Align v2] simalign loaded on {device} | model={align_model_name} "
         f"| methods={matching_methods} | monotonic={use_monotonic} | debug={debug_enabled}"
     )
-    return aligner, cfg
+    return aligner, cfg # 后面 get_word_alignments()用到
 
 
 def _to_monotonic_alignments(
@@ -188,7 +188,8 @@ def get_word_alignments(
     if not src_words or not tgt_words:
         return []
 
-    cfg = align_tokenizer if isinstance(align_tokenizer, dict) else {}
+    # 
+    cfg = align_tokenizer if isinstance(align_tokenizer, dict) else {} # align_tokenizer 实际上不是 tokenizer，而是 cfg 配置 dict
     matching_methods = str(cfg.get("matching_methods", "a"))
     use_monotonic = bool(cfg.get("use_monotonic", False))
     debug_enabled = bool(cfg.get("debug", False))
@@ -322,6 +323,6 @@ def get_word_alignments_batch(
 ) -> List[List[Tuple[int, int]]]:
     """Batch: call get_word_alignments for each pair (simalign has no native batch)."""
     return [
-        get_word_alignments(src_text, tgt_text, align_model, align_tokenizer)
+        get_word_alignments(src_text, tgt_text, align_model, align_tokenizer) # align_tokenizer 实际上不是 tokenizer，而是 cfg 配置 dict
         for src_text, tgt_text in pairs
     ]

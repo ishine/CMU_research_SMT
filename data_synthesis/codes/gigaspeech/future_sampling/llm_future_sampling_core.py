@@ -55,6 +55,9 @@ from openai import OpenAI, AsyncOpenAI
 # None when running single-threaded (no overhead).
 _base_llm_lock: Optional[threading.Lock] = None
 
+# Lock that serialises align_model (awesome-align / simalign) when parallel_utterances > 1.
+_align_model_lock: Optional[threading.Lock] = None
+
 # Batch future sampling: when set, sample_source_futures() submits to this queue
 # and a dedicated worker runs base_llm.generate([src1, src2, ...]) in batch (GPU0 并行).
 _future_sampling_request_queue: Optional[queue_module.Queue] = None
@@ -94,7 +97,7 @@ def parse_args() -> argparse.Namespace:
                    help="M: number of future source samples.")
     p.add_argument("--future-tokens", type=int, default=12,
                    help="Max tokens per continuation.")
-    p.add_argument("--sample-temperature", type=float, default=0.8)
+    p.add_argument("--sample-temperature", type=float, default=1.0)
     p.add_argument("--min-commit-chars", type=int, default=1)
     p.add_argument("--min-observed-words", type=int, default=2)
     p.add_argument("--score-threshold", type=int, default=80,
@@ -162,6 +165,55 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         dest="majority_vote_disable_backoff",
         help=argparse.SUPPRESS,
+    )
+    p.add_argument(
+        "--majority-vote-prompt-version",
+        choices=["simple_v1", "v2", "v3_cot"],
+        default="v2",
+        help=(
+            "Prompt variant for selection_mode=majority_vote. "
+            "simple_v1: minimal baseline with 2 examples; "
+            "v2: stronger anti-hallucination / divergence-aware prompt; "
+            "v3_cot: v2 plus explicit internal step-by-step reasoning instructions."
+        ),
+    )
+    p.add_argument(
+        "--majority-vote-use-reasoning",
+        action="store_true",
+        help=(
+            "For selection_mode=majority_vote, use a separate thinking/reasoning model "
+            "for Step 4 semantic prefix synthesis."
+        ),
+    )
+    p.add_argument(
+        "--majority-vote-reasoning-api-base",
+        default="",
+        help=(
+            "Optional API base for the Step-4 reasoning model. "
+            "If empty, reuse --instruct-api-base."
+        ),
+    )
+    p.add_argument(
+        "--majority-vote-reasoning-model-name",
+        default="Qwen/Qwen3-30B-A3B-Thinking-2507-FP8",
+        help="Model name used for majority_vote reasoning mode.",
+    )
+    p.add_argument(
+        "--majority-vote-reasoning-tokenizer-path",
+        default="/data/user_data/haolingp/models/Qwen3-30B-A3B-Thinking-2507-FP8",
+        help="Local tokenizer path used to build chat prompts for the majority_vote reasoning model.",
+    )
+    p.add_argument(
+        "--majority-vote-reasoning-temperature",
+        type=float,
+        default=0.6,
+        help="Sampling temperature for majority_vote reasoning mode.",
+    )
+    p.add_argument(
+        "--majority-vote-reasoning-max-tokens",
+        type=int,
+        default=512,
+        help="Max generation tokens for majority_vote reasoning mode.",
     )
 
     return p.parse_args()
@@ -379,6 +431,31 @@ def strip_committed_suffix_from_delta(committed: str, delta: str) -> str:
     return delta
 
 
+def _count_prefix_support(prefix: str, fragments: List[str], normalize_leading: bool = False) -> int:
+    if not prefix:
+        return 0
+    if normalize_leading:
+        prefix = _strip_majority_vote_leading_variants(prefix)
+        items = [_strip_majority_vote_leading_variants(f) for f in fragments if f]
+    else:
+        prefix = normalize_zh(prefix)
+        items = [normalize_zh(f) for f in fragments if f]
+    if not prefix:
+        return 0
+    return sum(1 for f in items if f.startswith(prefix))
+
+
+def _has_repeated_substring_pattern(text: str, min_unit: int = 3, max_unit: int = 8) -> bool:
+    t = normalize_zh(text or "")
+    if len(t) < min_unit * 2:
+        return False
+    for unit in range(min_unit, min(max_unit, len(t) // 2) + 1):
+        for i in range(0, len(t) - (2 * unit) + 1):
+            if t[i:i + unit] == t[i + unit:i + 2 * unit]:
+                return True
+    return False
+
+
 _LEADING_PUNCT = re.compile(r"^[，。、；：！？\s]+")
 _NOISE_PREFIXES = ("一们", "一为", "一名", "一位", "们", "为", "名", "位")
 
@@ -460,6 +537,8 @@ def _emit_simalign_alignment_debug(
     obs_words = [w for w in observed_src.strip().split() if w and not w.isspace()]
     obs_n = len(obs_words)
     tgt_norm = clean_translation_for_alignment(translation)
+    tgt_word_meta: List[Tuple[int, int, int, str]] = []
+    char_to_word_idx: Dict[int, int] = {}
 
     _vlog(log_file, f"{label} full_src_words={[f'{i}:{w}' for i, w in enumerate(src_words)]}")
     _vlog(log_file, f"{label} observed_src_words={[f'{i}:{w}' for i, w in enumerate(obs_words)]} obs_n={obs_n}")
@@ -473,6 +552,9 @@ def _emit_simalign_alignment_debug(
         start = 0
         for wi, word in enumerate(tgt_words):
             end = start + len(word) - 1
+            tgt_word_meta.append((wi, start, end, word))
+            for ci in range(start, end + 1):
+                char_to_word_idx[ci] = wi
             spans.append(f"{wi}:{start}-{end}:{word}")
             start = end + 1
         _vlog(log_file, f"{label} target_word_spans={spans}")
@@ -491,9 +573,16 @@ def _emit_simalign_alignment_debug(
         tgt_char = tgt_norm[t] if 0 <= t < len(tgt_norm) else "<OUT_OF_RANGE>"
         prefix = tgt_norm[: t + 1] if 0 <= t < len(tgt_norm) else ""
         status = "OBS" if s < obs_n else "FUTURE"
+        tgt_word_idx = char_to_word_idx.get(t)
+        if tgt_word_idx is not None and 0 <= tgt_word_idx < len(tgt_word_meta):
+            wi, start, end, word = tgt_word_meta[tgt_word_idx]
+            tgt_word_desc = f"{wi}:{start}-{end}:{word}"
+        else:
+            tgt_word_desc = "<NO_WORD_SPAN>"
         _vlog(
             log_file,
-            f"{label} pair src_idx={s} src_tok={src_tok!r} -> tgt_idx={t} tgt_char={tgt_char!r} "
+            f"{label} pair src_idx={s} src_tok={src_tok!r} "
+            f"-> tgt_word={tgt_word_desc} -> tgt_idx={t} tgt_char={tgt_char!r} "
             f"status={status} prefix={prefix!r}",
         )
         if s < obs_n:
@@ -508,6 +597,11 @@ def _emit_simalign_alignment_debug(
         f"{label} truncation_scan safe_char_idx={safe_char_idx} "
         f"first_future_pair={first_future_pair} cut_prefix={cut_prefix!r}",
     )
+
+
+_VERBOSE_ALIGNMENT_DEBUG = os.environ.get("VERBOSE_ALIGNMENT_DEBUG", "").strip().lower() in {
+    "1", "true", "yes", "on"
+}
 
 
 def _extract_reference_text_from_row(row: Dict[str, str]) -> Optional[str]:
@@ -841,74 +935,80 @@ def get_word_alignments(
     tgt_total = sum(tgt_token_lens)
     joint_total = src_total + tgt_total
 
-    # Fast path: fits in one pass.
-    if joint_total <= per_pass_budget:
-        return _align_single(src_subwords, tgt_subwords)
+    def _run_alignment() -> List[Tuple[int, int]]:
+        # Fast path: fits in one pass.
+        if joint_total <= per_pass_budget:
+            return _align_single(src_subwords, tgt_subwords)
 
-    # Hard guard: do not attempt alignment beyond 1024 subwords.
-    if joint_total > max_joint_subwords:
-        return []
+        # Hard guard: do not attempt alignment beyond 1024 subwords.
+        if joint_total > max_joint_subwords:
+            return []
 
-    # 513..1024: two-pass alignment with global index offsets.
-    src_n = len(src_subwords)
-    tgt_n = len(tgt_subwords)
-    if src_n < 2 or tgt_n < 2:
-        return []
+        # 513..1024: two-pass alignment with global index offsets.
+        src_n = len(src_subwords)
+        tgt_n = len(tgt_subwords)
+        if src_n < 2 or tgt_n < 2:
+            return []
 
-    src_ps = [0]
-    for v in src_token_lens:
-        src_ps.append(src_ps[-1] + v)
-    tgt_ps = [0]
-    for v in tgt_token_lens:
-        tgt_ps.append(tgt_ps[-1] + v)
+        src_ps = [0]
+        for v in src_token_lens:
+            src_ps.append(src_ps[-1] + v)
+        tgt_ps = [0]
+        for v in tgt_token_lens:
+            tgt_ps.append(tgt_ps[-1] + v)
 
-    src_mid = src_total / 2.0
-    tgt_mid = tgt_total / 2.0
-    split_pair: Optional[Tuple[int, int]] = None
-    best_score = float("inf")
+        src_mid = src_total / 2.0
+        tgt_mid = tgt_total / 2.0
+        split_pair: Optional[Tuple[int, int]] = None
+        best_score = float("inf")
 
-    for s_split in range(1, src_n):
-        left_src = src_ps[s_split]
-        right_src = src_total - left_src
-        if left_src > per_pass_budget or right_src > per_pass_budget:
-            continue
-
-        lower = tgt_total - (per_pass_budget - right_src)
-        upper = per_pass_budget - left_src
-        if lower > upper:
-            continue
-
-        lo_idx = bisect.bisect_left(tgt_ps, lower, 1, tgt_n)
-        hi_idx = bisect.bisect_right(tgt_ps, upper, 1, tgt_n) - 1
-        if lo_idx > hi_idx:
-            continue
-
-        target = tgt_mid
-        cand = bisect.bisect_left(tgt_ps, target, lo_idx, hi_idx + 1)
-        for t_split in (cand - 1, cand):
-            if t_split < lo_idx or t_split > hi_idx:
+        for s_split in range(1, src_n):
+            left_src = src_ps[s_split]
+            right_src = src_total - left_src
+            if left_src > per_pass_budget or right_src > per_pass_budget:
                 continue
-            if t_split <= 0 or t_split >= tgt_n:
+
+            lower = tgt_total - (per_pass_budget - right_src)
+            upper = per_pass_budget - left_src
+            if lower > upper:
                 continue
-            score = abs(left_src - src_mid) + abs(tgt_ps[t_split] - tgt_mid)
-            if score < best_score:
-                best_score = score
-                split_pair = (s_split, t_split)
 
-    if split_pair is None:
-        return []
+            lo_idx = bisect.bisect_left(tgt_ps, lower, 1, tgt_n)
+            hi_idx = bisect.bisect_right(tgt_ps, upper, 1, tgt_n) - 1
+            if lo_idx > hi_idx:
+                continue
 
-    s_split, t_split = split_pair
-    # Each half gets its own monotonic pass inside _align_single (via src/tgt offsets).
-    left = _align_single(src_subwords[:s_split], tgt_subwords[:t_split],
-                         src_offset=0, tgt_offset=0)
-    right = _align_single(src_subwords[s_split:], tgt_subwords[t_split:],
-                          src_offset=s_split, tgt_offset=t_split)
+            target = tgt_mid
+            cand = bisect.bisect_left(tgt_ps, target, lo_idx, hi_idx + 1)
+            for t_split in (cand - 1, cand):
+                if t_split < lo_idx or t_split > hi_idx:
+                    continue
+                if t_split <= 0 or t_split >= tgt_n:
+                    continue
+                score = abs(left_src - src_mid) + abs(tgt_ps[t_split] - tgt_mid)
+                if score < best_score:
+                    best_score = score
+                    split_pair = (s_split, t_split)
 
-    merged = left + right
-    # Final global monotonic pass over the combined halves to eliminate any
-    # boundary crossings introduced by merging the two independent passes.
-    return _make_monotonic(merged, src_n, tgt_n)
+        if split_pair is None:
+            return []
+
+        s_split, t_split = split_pair
+        # Each half gets its own monotonic pass inside _align_single (via src/tgt offsets).
+        left = _align_single(src_subwords[:s_split], tgt_subwords[:t_split],
+                             src_offset=0, tgt_offset=0)
+        right = _align_single(src_subwords[s_split:], tgt_subwords[t_split:],
+                              src_offset=s_split, tgt_offset=t_split)
+
+        merged = left + right
+        # Final global monotonic pass over the combined halves to eliminate any
+        # boundary crossings introduced by merging the two independent passes.
+        return _make_monotonic(merged, src_n, tgt_n)
+
+    if _align_model_lock is not None:
+        with _align_model_lock:
+            return _run_alignment()
+    return _run_alignment()
 
 
 # Max target chars per observed source word when aligning few words to many chars.
@@ -1094,14 +1194,25 @@ def get_word_alignments_batch(
         tt_t  = torch.tensor(padded_tt,  dtype=torch.long, device=_dev)
         am_t  = torch.tensor(attn_masks, dtype=torch.long, device=_dev)
 
-        with torch.no_grad():
-            out = align_model(
-                input_ids=ids_t,
-                token_type_ids=tt_t,
-                attention_mask=am_t,
-                output_hidden_states=True,
-            )
-        hidden_batch = out.hidden_states[8]  # [B, max_len, hidden_dim]
+        if _align_model_lock is not None:
+            with _align_model_lock:
+                with torch.no_grad():
+                    out = align_model(
+                        input_ids=ids_t,
+                        token_type_ids=tt_t,
+                        attention_mask=am_t,
+                        output_hidden_states=True,
+                    )
+                hidden_batch = out.hidden_states[8]  # [B, max_len, hidden_dim]
+        else:
+            with torch.no_grad():
+                out = align_model(
+                    input_ids=ids_t,
+                    token_type_ids=tt_t,
+                    attention_mask=am_t,
+                    output_hidden_states=True,
+                )
+            hidden_batch = out.hidden_states[8]  # [B, max_len, hidden_dim]
 
         for b, (orig_i, (src_sw, tgt_sw, src_len)) in enumerate(
             zip(batch_orig_idx, batch_meta)
@@ -1364,7 +1475,6 @@ def _run_batch_future_sampling_worker(
             futures: List[str] = []
             for out in outputs[i].outputs:
                 cleaned = clean_continuation(observed_source, out.text)
-                cleaned = truncate_future_to_first_sentence(cleaned)
                 if cleaned:
                     futures.append(cleaned)
             result_q.put(futures)
@@ -1398,7 +1508,6 @@ def sample_source_futures(
     futures: List[str] = []
     for out in outputs[0].outputs:
         cleaned = clean_continuation(observed_source, out.text)
-        cleaned = truncate_future_to_first_sentence(cleaned)
         if cleaned:
             futures.append(cleaned)
     return futures
@@ -1432,10 +1541,15 @@ def _build_instruct_generate_prompt(
     return text
 
 
+def _uses_thinking_model(model_name_or_path: str) -> bool:
+    return "thinking" in (model_name_or_path or "").lower()
+
+
 def _build_translation_prompt_text(
     tokenizer: Any,
     observed_source: str,
     committed: str,
+    force_close_think: bool = False,
 ) -> str:
     committed_instruction = ""
     if committed:
@@ -1453,18 +1567,30 @@ def _build_translation_prompt_text(
             f"{committed_instruction}"
         ),
     }]
-    text = tokenizer.apply_chat_template(
-        messages,
-        add_generation_prompt=False,
-        tokenize=False,
-    )
-    text += "<|im_start|>assistant\n"
+    if force_close_think:
+        text = tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+        text += "</think>\n"
+    else:
+        text = tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=False,
+            tokenize=False,
+        )
+        text += "<|im_start|>assistant\n"
     if committed:
         text += normalize_zh(committed)
     return text
 
 
-def _build_sentence_translation_prompt_text(tokenizer: Any, observed_source: str) -> str:
+def _build_sentence_translation_prompt_text(
+    tokenizer: Any,
+    observed_source: str,
+    force_close_think: bool = False,
+) -> str:
     messages = [{
         "role": "user",
         "content": (
@@ -1475,12 +1601,20 @@ def _build_sentence_translation_prompt_text(tokenizer: Any, observed_source: str
             f"[INPUT]\n{observed_source}"
         ),
     }]
-    text = tokenizer.apply_chat_template(
-        messages,
-        add_generation_prompt=False,
-        tokenize=False,
-    )
-    text += "<|im_start|>assistant\n"
+    if force_close_think:
+        text = tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+        text += "</think>\n"
+    else:
+        text = tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=False,
+            tokenize=False,
+        )
+        text += "<|im_start|>assistant\n"
     return text
 
 
@@ -1511,15 +1645,21 @@ async def _translate_batch_async(
     sources: List[str],
     committed: str = "",
     use_sentence_prompt: bool = False,
+    force_close_think: bool = False,
 ) -> List[str]:
     async def _one(src: str) -> str:
         if use_sentence_prompt:
-            prompt_text = _build_sentence_translation_prompt_text(instruct_tokenizer, observed_source=src)
+            prompt_text = _build_sentence_translation_prompt_text(
+                instruct_tokenizer,
+                observed_source=src,
+                force_close_think=force_close_think,
+            )
         else:
             prompt_text = _build_translation_prompt_text(
                 instruct_tokenizer,
                 observed_source=src,
                 committed=committed,
+                force_close_think=force_close_think,
             )
         resp = await client.completions.create(
             model=model,
@@ -1542,12 +1682,14 @@ async def _translate_batch_with_client_async(
     sources: List[str],
     committed: str = "",
     use_sentence_prompt: bool = False,
+    force_close_think: bool = False,
 ) -> List[str]:
     client = _make_async_client(api_base)
     try:
         return await _translate_batch_async(
             client, model, instruct_tokenizer, sources, committed,
             use_sentence_prompt=use_sentence_prompt,
+            force_close_think=force_close_think,
         )
     finally:
         await client.close()
@@ -1568,7 +1710,8 @@ def translate_candidates(
 
     extensions = asyncio.run(
         _translate_batch_with_client_async(
-            api_base, model, instruct_tokenizer, sources, committed
+            api_base, model, instruct_tokenizer, sources, committed,
+            force_close_think=_uses_thinking_model(model),
         )
     )
     committed_norm = normalize_zh(committed) if committed else ""
@@ -1594,6 +1737,7 @@ def translate_final(
         instruct_tokenizer,
         observed_source=full_source,
         committed=committed,
+        force_close_think=_uses_thinking_model(model),
     )
     resp = client.completions.create(
         model=model,
@@ -1618,11 +1762,13 @@ def translate_final_base(
     instruct_tokenizer,
     full_source: str,
     committed: str,
+    force_close_think: bool = False,
 ) -> str:
     prompt_text = _build_translation_prompt_text(
         instruct_tokenizer,
         observed_source=full_source,
         committed=committed,
+        force_close_think=force_close_think,
     )
     params = SamplingParams(
         temperature=0.0,
@@ -1943,6 +2089,201 @@ def get_lcp70_llm_delta_via_llm(
     return valid_output
 
 
+#
+# Prompt diff summary: CURRENT V2 vs SIMPLE V1
+# 1. V2 adds explicit "stop before divergence" and "do not invent content" rules;
+#    V1 only says "stay close to fragments", which is weaker against hallucination.
+# 2. V2 includes boundary-case examples (divergence, subject conflict, hallucination risk);
+#    V1 mostly demonstrates synonym merging plus one noun-conflict counter-example.
+# 3. V2 makes K-of-M support and EMPTY conditions more explicit;
+#    V1 leaves more of that reasoning implicit in the examples.
+# 4. V2 uses a single canonical answer for the divergence example ("这些介绍");
+#    V1-style prompting had looser guidance, which can encourage unstable outputs.
+# 5. Both avoid numeric labels in live prompts, but V2's output rules more strongly
+#    forbid copying labels/brackets and are paired with output sanitization in code.
+#
+def build_majority_vote_prompt_v2(
+    observed_source: str,
+    committed_norm: str,
+    fragments: List[str],
+    K: int,
+    start_anchor: str = "",
+    max_chars: int = 20,
+) -> str:
+    M = len(fragments)
+    frag_str = "\n".join(f'候选{chr(65 + i)}: "{f}"' for i, f in enumerate(fragments))
+    anchor_block = (
+        f'Literal start anchor shared by many fragments: "{start_anchor}"\n'
+        "- Your output must start with this anchor exactly.\n"
+        "- Do NOT skip this anchor and jump to a later content word.\n\n"
+        if start_anchor
+        else ""
+    )
+    return (
+        "You are finding the Semantic Common Prefix (SCP) of Chinese translation fragments.\n\n"
+        "What is Semantic LCP:\n"
+        "- Literal LCP = exact same starting characters.\n"
+        "- Semantic LCP = same starting meaning, even if wording differs.\n"
+        "- Synonyms count as same meaning.\n"
+        "- Ignore leading connectives or punctuation differences such as 而且 / 并且 / 而 / ，.\n\n"
+        "Common synonym families:\n"
+        "- 编辑 ↔ 编者\n"
+        "- 任务 ↔ 职责 ↔ 工作\n"
+        "- 寻找 ↔ 搜寻 ↔ 去找\n"
+        "- 道歉 ↔ 表示歉意\n"
+        "- 重要 ↔ 关键 ↔ 至关重要\n\n"
+        "Your task:\n"
+        f"- Read the {M} fragments below.\n"
+        f"- Find the longest short prefix S (at most {max_chars} Chinese characters) such that at least K={K} fragments begin with the SAME MEANING as S.\n"
+        "- S must stay aligned to the START of the fragments.\n"
+        "- Do NOT skip earlier words and jump directly to a later content word.\n"
+        "- Stop S before any point where fragments disagree on a key fact, noun, role, subject, object, or predicate.\n"
+        "- Do NOT invent content that is not grounded in at least K fragments.\n"
+        "- If fewer than K fragments support a safe S, output EMPTY.\n\n"
+        f'English observed so far: "{observed_source}"\n'
+        f'Committed Chinese (already output, do NOT repeat it): "{committed_norm}"\n\n'
+        f"{anchor_block}"
+        f"Fragments (M={M}, need K={K} support):\n{frag_str}\n\n"
+        "Example 1 — synonyms merge:\n"
+        "Committed: \"\"\n"
+        "K=3\n"
+        "候选A: \"编辑的职责是寻找故事\"\n"
+        "候选B: \"编者的任务就是搜寻故事\"\n"
+        "候选C: \"编辑的工作是找故事\"\n"
+        "SCP: 编辑的任务是寻找故事\n\n"
+        "Example 2 — stop before divergence:\n"
+        "Committed: \"\"\n"
+        "K=3\n"
+        "候选A: \"这些介绍既长又无用\"\n"
+        "候选B: \"这些介绍冗长且令人厌倦\"\n"
+        "候选C: \"这些介绍简单又无效\"\n"
+        "SCP: 这些介绍\n\n"
+        "Example 3 — EMPTY due to key noun conflict:\n"
+        "Committed: \"\"\n"
+        "K=3\n"
+        "候选A: \"编辑只是编辑\"\n"
+        "候选B: \"人只是人\"\n"
+        "候选C: \"出版商只是出版商\"\n"
+        "SCP: EMPTY\n\n"
+        "Example 4 — EMPTY: no K-way agreement (subject/predicate differ):\n"
+        "Committed: \"\"\n"
+        "K=3\n"
+        "候选A: \"他感到高兴\"\n"
+        "候选B: \"她感到悲伤\"\n"
+        "候选C: \"他们感到困惑\"\n"
+        "SCP: EMPTY\n\n"
+        "Example 5 — do not skip the beginning:\n"
+        "Committed: \"\"\n"
+        "K=3\n"
+        "候选A: \"迫使编辑承认\"\n"
+        "候选B: \"迫使编辑声明\"\n"
+        "候选C: \"迫使编辑解释\"\n"
+        "SCP: 迫使编辑\n"
+        "Bad: 编辑\n\n"
+        "Example 6 — committed non-empty, output only the new delta:\n"
+        "Committed: \"编辑的\"\n"
+        "K=3\n"
+        "候选A: \"任务是寻找好故事\"\n"
+        "候选B: \"工作是搜寻好故事\"\n"
+        "候选C: \"职责是找到好故事\"\n"
+        "SCP: 任务是寻找好故事\n"
+        "Bad: 编辑的任务是寻找好故事  ← wrong, repeats committed\n\n"
+        "Example 7 — committed non-empty, EMPTY because delta diverges immediately:\n"
+        "Committed: \"这是一个\"\n"
+        "K=3\n"
+        "候选A: \"重要的科学突破\"\n"
+        "候选B: \"关键的政治决定\"\n"
+        "候选C: \"深刻的历史时刻\"\n"
+        "SCP: EMPTY (重要/关键/深刻 and 科学突破/政治决定/历史时刻 are not the same meaning)\n\n"
+        "Output rules:\n"
+        "- Output ONLY S on one line, or exactly EMPTY.\n"
+        "- No quotes, no labels, no brackets, no explanation.\n"
+        "- Do NOT copy labels such as 候选A, A, [A], [1], [2], or list markers.\n"
+        "- Do the K-of-M support check silently yourself."
+    )
+
+
+def build_majority_vote_prompt_v3_cot(
+    observed_source: str,
+    committed_norm: str,
+    fragments: List[str],
+    K: int,
+    start_anchor: str = "",
+    max_chars: int = 20,
+) -> str:
+    M = len(fragments)
+    frag_str = "\n".join(f'候选{chr(65 + i)}: "{f}"' for i, f in enumerate(fragments))
+    anchor_block = (
+        f'Literal start anchor shared by many fragments: "{start_anchor}"\n'
+        "- Your final answer must start with this anchor exactly.\n"
+        "- Do NOT skip this anchor and jump to a later content word.\n\n"
+        if start_anchor
+        else ""
+    )
+    return (
+        "You are finding the Semantic Common Prefix (SCP) of Chinese translation fragments.\n\n"
+        "Literal LCP means the exact same starting characters.\n"
+        "Semantic LCP means the same starting meaning, even if wording differs.\n"
+        "Synonyms count as the same meaning. Ignore leading connectives/punctuation differences "
+        "such as 而且 / 并且 / 而 / ，.\n\n"
+        "Common synonym families:\n"
+        "- 编辑 ↔ 编者\n"
+        "- 任务 ↔ 职责 ↔ 工作\n"
+        "- 寻找 ↔ 搜寻 ↔ 去找\n"
+        "- 道歉 ↔ 表示歉意\n"
+        "- 重要 ↔ 关键 ↔ 至关重要\n\n"
+        "Task:\n"
+        f"- Read all {M} fragments.\n"
+        f"- Find the longest short prefix S (at most {max_chars} Chinese characters) such that at least K={K} fragments begin with the SAME MEANING as S.\n"
+        "- S must stay aligned to the START of the fragments.\n"
+        "- Do NOT skip earlier words and jump to a later content word.\n"
+        "- Stop before any divergence in key fact, noun, role, subject, object, or predicate.\n"
+        "- Do NOT invent content not grounded in at least K fragments.\n"
+        "- If fewer than K fragments support a safe S, output EMPTY.\n\n"
+        "Reasoning procedure (do this silently, do NOT output your reasoning):\n"
+        "1. Normalize leading connectives/punctuation.\n"
+        "2. Compare the fragment beginnings one by one.\n"
+        "3. Identify the earliest shared meaning.\n"
+        "4. Extend S only while at least K fragments still support the SAME starting meaning.\n"
+        "5. The moment support drops below K, stop.\n"
+        "6. Before answering, check again that your final S starts at the fragment beginning and is supported by at least K fragments.\n\n"
+        f'English observed so far: "{observed_source}"\n'
+        f'Committed Chinese (already output, do NOT repeat it): "{committed_norm}"\n\n'
+        f"{anchor_block}"
+        f"Fragments (M={M}, need K={K} support):\n{frag_str}\n\n"
+        "Example 1 — synonyms merge:\n"
+        "K=3\n"
+        "候选A: \"编辑的职责是寻找故事\"\n"
+        "候选B: \"编者的任务就是搜寻故事\"\n"
+        "候选C: \"编辑的工作是找故事\"\n"
+        "SCP: 编辑的任务是寻找故事\n\n"
+        "Example 2 — stop before divergence:\n"
+        "K=3\n"
+        "候选A: \"而且这些介绍既单调又无用\"\n"
+        "候选B: \"而且这些介绍冗长且令人厌倦\"\n"
+        "候选C: \"而且这些介绍既枯燥又无效\"\n"
+        "SCP: 这些介绍\n\n"
+        "Example 3 — EMPTY due to key noun conflict:\n"
+        "K=3\n"
+        "候选A: \"编辑只是编辑\"\n"
+        "候选B: \"作者只是作者\"\n"
+        "候选C: \"出版商只是出版商\"\n"
+        "SCP: EMPTY\n\n"
+        "Example 4 — do not skip the beginning:\n"
+        "K=3\n"
+        "候选A: \"迫使编辑承认\"\n"
+        "候选B: \"迫使编辑声明\"\n"
+        "候选C: \"迫使编辑解释\"\n"
+        "SCP: 迫使编辑\n"
+        "Bad: 编辑\n\n"
+        "Output rules:\n"
+        "- Think step by step silently, then output ONLY the final answer.\n"
+        "- Output EXACTLY ONE line: either S or EMPTY.\n"
+        "- No quotes, no labels, no brackets, no explanation.\n"
+        "- Do NOT copy labels such as 候选A, A, [A], [1], [2], or list markers."
+    )
+
+
 def build_majority_vote_prompt(
     observed_source: str,
     committed_norm: str,
@@ -1950,59 +2291,72 @@ def build_majority_vote_prompt(
     K: int,
     max_chars: int = 20,
 ) -> str:
+    """Compatibility wrapper. Current runtime default = V2."""
+    return build_majority_vote_prompt_v2(
+        observed_source=observed_source,
+        committed_norm=committed_norm,
+        fragments=fragments,
+        K=K,
+        max_chars=max_chars,
+    )
+
+
+#
+# SIMPLE V1 PROMPT
+# - Kept only for side-by-side comparison with the current V2 prompt above.
+# - Simpler and shorter, but weaker on divergence handling and anti-hallucination guidance.
+# - Can be selected explicitly via --majority-vote-prompt-version simple_v1.
+#
+def build_majority_vote_prompt_simple_v1(
+    observed_source: str,
+    committed_norm: str,
+    fragments: List[str],
+    K: int,
+    max_chars: int = 20,
+) -> str:
+    """Minimal majority-vote baseline prompt with examples covering committed="" and committed!="" cases."""
     M = len(fragments)
-    frag_str = "\n".join(f'[{i + 1}] "{f}"' for i, f in enumerate(fragments))
+    frag_str = "\n".join(f'候选{chr(65 + i)}: "{f}"' for i, f in enumerate(fragments))
     return (
-        "You are doing SEMANTIC LCP for Chinese incremental translation.\n\n"
-        "Definition:\n"
-        "- Literal LCP = same starting characters.\n"
-        "- Semantic LCP = same starting meaning, even if wording differs.\n"
-        "- The main reason to use semantic LCP is to merge simple synonyms and paraphrases.\n\n"
-        "Your task:\n"
-        f"- Read the {M} Chinese fragments below.\n"
-        f"- Find one short Chinese prefix S such that at least K={K} fragments start with the SAME MEANING as S.\n"
-        "- S may use synonyms, but must stay close to the fragments.\n"
-        "- Do not summarize beyond the beginning of the fragments.\n"
-        "- Do not introduce new facts.\n"
-        "- If the fragments disagree on a key noun/role/fact, stop before that disagreement or output EMPTY.\n"
-        f"- Keep S short and conservative: at most {max_chars} Chinese characters.\n\n"
-        "What counts as 'same meaning':\n"
-        "- 编辑 / 编者\n"
-        "- 任务 / 职责 / 工作\n"
-        "- 寻找 / 搜寻 / 去找\n"
-        "- 广博 / 浩瀚 / 范围很广\n"
-        "- later he apologized / later he expressed歉意 -> 后来他道歉\n\n"
-        "Observed English so far:\n"
-        f"\"{observed_source}\"\n\n"
-        "Committed Chinese (already fixed, do NOT repeat it):\n"
-        f"\"{committed_norm}\"\n\n"
+        "Task: find one short semantic prefix that best matches the common beginning "
+        "of the Chinese fragments below.\n\n"
+        "A semantic prefix means: the fragments may use different words, but they begin "
+        "with the same meaning.\n\n"
+        "IMPORTANT: The fragments are already the NEW part after what is committed. "
+        "Your output must be a continuation of the committed text, NOT repeat it.\n\n"
+        f'English (observed so far): "{observed_source}"\n'
+        f'Committed Chinese (do NOT repeat): "{committed_norm}"\n'
         f"Fragments (M={M}):\n{frag_str}\n\n"
-        "Example 1:\n"
-        "K=3\n"
-        "[1] \"编辑的职责在于寻找这些故事的集子\"\n"
-        "[2] \"编者的任务是搜寻这些故事的集子\"\n"
-        "[3] \"编辑的工作就是去找这些故事的集子\"\n"
-        "Answer: 编辑的任务是寻找这些故事的集子\n"
-        "Reason: 编辑/编者, 任务/职责/工作, 寻找/搜寻/去找 are simple synonyms.\n\n"
-        "Example 2:\n"
-        "K=3\n"
-        "[1] \"后来他公开道歉\"\n"
-        "[2] \"后来他正式表示歉意\"\n"
-        "[3] \"后来他为此事道歉\"\n"
-        "Answer: 后来他道歉\n"
-        "Reason: 道歉 / 表示歉意 are the same meaning here.\n\n"
-        "Counter-example:\n"
-        "K=3\n"
-        "[1] \"编辑只是编辑\"\n"
-        "[2] \"作者只是作者\"\n"
-        "[3] \"发现者只是发现者\"\n"
-        "Answer: EMPTY\n"
-        "Reason: the key role noun conflicts.\n\n"
-        "Output rules:\n"
-        "- Output ONLY S on one line, or exactly EMPTY.\n"
-        "- No explanation.\n"
-        "- Do the K-of-M support check silently yourself.\n"
-        "- Think of this as: find the longest safe semantic common prefix."
+        "Example 1 — committed empty, synonyms merge:\n"
+        "Committed: \"\"\n"
+        "候选A: \"编辑的职责是寻找好故事\"\n"
+        "候选B: \"编者的任务就是搜寻好故事\"\n"
+        "候选C: \"编辑的工作是去找好故事\"\n"
+        "SCP: 编辑的任务是寻找好故事\n\n"
+        "Example 2 — committed non-empty, output only the new delta:\n"
+        "Committed: \"编辑的\"\n"
+        "候选A: \"任务是寻找好故事\"\n"
+        "候选B: \"工作是搜寻好故事\"\n"
+        "候选C: \"职责是找到好故事\"\n"
+        "SCP: 任务是寻找好故事\n"
+        "Bad: 编辑的任务是寻找好故事  ← wrong, repeats committed\n\n"
+        "Example 3 — EMPTY due to key noun conflict:\n"
+        "Committed: \"\"\n"
+        "候选A: \"编辑只是编辑\"\n"
+        "候选B: \"作者只是作者\"\n"
+        "候选C: \"发现者只是发现者\"\n"
+        "SCP: EMPTY\n\n"
+        "Example 4 — committed non-empty, EMPTY because delta diverges immediately:\n"
+        "Committed: \"这是一个\"\n"
+        "候选A: \"重要的科学突破\"\n"
+        "候选B: \"关键的政治决定\"\n"
+        "候选C: \"深刻的历史时刻\"\n"
+        "SCP: EMPTY\n\n"
+        "Rules:\n"
+        f"- Output ONLY S (at most {max_chars} Chinese characters), or exactly EMPTY.\n"
+        "- S must not repeat the committed text.\n"
+        "- No labels, no quotes, no explanation.\n"
+        "- Follow the pattern shown in the examples."
     )
 
 
@@ -2088,11 +2442,35 @@ def _majority_vote_quorum_backoff(output: str, fragments: List[str], K: int) -> 
     return longest_prefix_with_quorum(norm_fragments, K)
 
 
+def _compute_majority_vote_start_anchor(fragments: List[str], K: int) -> str:
+    if not fragments or K <= 0:
+        return ""
+    norm_fragments = [_strip_majority_vote_leading_variants(f) for f in fragments if f]
+    norm_fragments = [f for f in norm_fragments if f]
+    if len(norm_fragments) < K:
+        return ""
+    return longest_prefix_with_quorum(norm_fragments, K)
+
+
 def _is_latin_heavy_delta(text: str, ratio: float = 0.30) -> bool:
     if not text:
         return False
     latin = sum(1 for c in text if c.isascii() and c.isalpha())
     return (latin / max(1, len(text))) > ratio
+
+
+_MAJORITY_VOTE_LEAK_PREFIX_RE = re.compile(
+    r'^(?:\s*(?:候选[A-Z]|Candidate\s*[A-Z]|[A-Z])\s*[:：]\s*|\s*\[[A-Z0-9]+\]\s*|["“”\'`])+'
+)
+
+
+def sanitize_majority_vote_output(text: str) -> str:
+    text = normalize_zh(text or "")
+    if not text:
+        return ""
+    text = _MAJORITY_VOTE_LEAK_PREFIX_RE.sub("", text)
+    text = text.lstrip("\"'“”`[]:： \t")
+    return text.strip()
 
 
 def get_majority_vote_delta_via_llm(
@@ -2104,6 +2482,10 @@ def get_majority_vote_delta_via_llm(
     candidate_safe_prefixes: List[str],
     consensus_ratio: float = 0.7,
     disable_backoff: bool = False,
+    prompt_version: str = "v2",
+    use_reasoning: bool = False,
+    reasoning_temperature: float = 0.6,
+    reasoning_max_tokens: int = 512,
 ) -> str:
     """Simple semantic-LCP baseline for majority_vote.
 
@@ -2118,33 +2500,47 @@ def get_majority_vote_delta_via_llm(
         return ""
 
     committed_norm, deltas = _extract_deltas_from_safe_prefixes(
-        committed, candidate_safe_prefixes
+        committed, candidate_safe_prefixes # ← 输入是完整 prefix
     )
-    fragments = [d for d in deltas if d]
-    M = len(deltas)
+    fragments = [d for d in deltas if d] ## ← 传给 prompt 的是 delta！
+    print(f"fragments={fragments}") 
+    M = len(deltas) 
     K = max(1, math.ceil(consensus_ratio * M))
     if len(fragments) < K:
         return ""
 
     client = _make_sync_client(api_base)
+    start_anchor = _compute_majority_vote_start_anchor(fragments, K)
 
-    synth_prompt = build_majority_vote_prompt(
-        observed_source, committed_norm, fragments, K
-    )
+    if prompt_version == "simple_v1":
+        synth_prompt = build_majority_vote_prompt_simple_v1(
+            observed_source, committed_norm, fragments, K
+        )
+    elif prompt_version == "v3_cot":
+        synth_prompt = build_majority_vote_prompt_v3_cot(
+            observed_source, committed_norm, fragments, K,
+            start_anchor=start_anchor,
+        )
+    else:
+        synth_prompt = build_majority_vote_prompt_v2(
+            observed_source, committed_norm, fragments, K,
+            start_anchor=start_anchor,
+        )
+    assistant_prefix = "" if use_reasoning else "</think>\n"
     prompt_text = _build_instruct_generate_prompt(
-        instruct_tokenizer, synth_prompt, assistant_prefix="</think>\n"
+        instruct_tokenizer, synth_prompt, assistant_prefix=assistant_prefix
     )
     try:
         resp = client.completions.create(
             model=model,
             prompt=prompt_text,
-            temperature=0.0,
-            max_tokens=128,
+            temperature=reasoning_temperature if use_reasoning else 0.0,
+            max_tokens=reasoning_max_tokens if use_reasoning else 128,
             stop=["<|im_end|>"],
         )
         raw = (resp.choices[0].text or "").strip()
         first_line = next((ln.strip() for ln in raw.splitlines() if ln.strip()), "")
-        output = normalize_zh(clean_llm_output(first_line))
+        output = sanitize_majority_vote_output(clean_llm_output(first_line))
     except Exception as e:
         print(f"[MajorityVote] synthesis exception: {e}", flush=True)
         return ""
@@ -2154,6 +2550,10 @@ def get_majority_vote_delta_via_llm(
         return ""
     if committed_norm and output.startswith(committed_norm):
         output = output[len(committed_norm):]
+    if prompt_version != "simple_v1" and start_anchor:
+        if not output.startswith(start_anchor):
+            if start_anchor.endswith(output) and len(start_anchor) >= 2:
+                output = start_anchor
     if not output:
         return ""
     if _is_latin_heavy_delta(output):
@@ -2168,7 +2568,9 @@ def get_majority_vote_delta_via_llm(
     if len(output) > 20:
         output = output[:20]
     print(
-        f"[MajorityVoteSimple] output={repr(output[:60])} K={K} fragments={len(fragments)}",
+        f"[MajorityVoteSimple] prompt={prompt_version} reasoning={use_reasoning} "
+        f"anchor={repr(start_anchor)} output={repr(output[:60])} "
+        f"K={K} fragments={len(fragments)}",
         flush=True,
     )
     return output
@@ -2191,6 +2593,7 @@ def precompute_sentence_translations(
         _translate_batch_with_client_async(
             api_base, model, instruct_tokenizer, sentences, committed="",
             use_sentence_prompt=True,
+            force_close_think=_uses_thinking_model(model),
         )
     )
     out = []
@@ -2247,6 +2650,9 @@ def process_one_utterance(
     api_base: str,
     instruct_model: str,
     instruct_tokenizer,
+    majority_vote_api_base: str,
+    majority_vote_model: str,
+    majority_vote_tokenizer,
     align_model,
     align_tokenizer,
     utt_id: str,
@@ -2336,6 +2742,7 @@ def process_one_utterance(
                     base_llm,
                     instruct_tokenizer,
                     accumulated_source, committed_norm,
+                    force_close_think=_uses_thinking_model(args.instruct_model_name),
                 )
             else:
                 full_translation = translate_final(
@@ -2476,7 +2883,7 @@ def process_one_utterance(
                 local_obs_src_ctx, sent_translation_sent, align_model, align_tokenizer
             )
             t3_align_model_sum = time.perf_counter() - t3a_0
-            if getattr(args, "align_method", "awesome_align") == "simalign":
+            if _VERBOSE_ALIGNMENT_DEBUG and getattr(args, "align_method", "awesome_align") == "simalign":
                 _emit_simalign_alignment_debug(
                     verbose_log_file,
                     "  [Step 3 sentence alignments]",
@@ -2716,7 +3123,7 @@ def process_one_utterance(
                 f'len_ok={c["length_ok"]} delta_len={len(c["delta"])} '
                 f'safe_prefix="{c["safe_prefix"]}"'
             )
-            if getattr(args, "align_method", "awesome_align") == "simalign":
+            if _VERBOSE_ALIGNMENT_DEBUG and getattr(args, "align_method", "awesome_align") == "simalign":
                 _emit_simalign_alignment_debug(
                     verbose_log_file,
                     f'      [candidate {c["idx"]}]',
@@ -2756,6 +3163,7 @@ def process_one_utterance(
         t4 = 0.0
         candidate_safe_prefixes = [c["safe_prefix"] for c in valid_candidates]
         selection_mode = getattr(args, "selection_mode", "majority_vote")
+        global_quorum_k = max(1, math.ceil(args.consensus_ratio * len(candidate_infos)))
         t4_0 = time.perf_counter()
         if selection_mode == "lcp_code":
             if len(valid_candidates) < 2:
@@ -2804,13 +3212,29 @@ def process_one_utterance(
             )
             step4_tag = f"LLMQuorumBoundary{int(round(args.consensus_ratio * 100))}"
         elif selection_mode == "majority_vote":
-            new_chars = get_majority_vote_delta_via_llm(
-                api_base, instruct_model, instruct_tokenizer,
-                accumulated_source, committed_norm, candidate_safe_prefixes,
-                consensus_ratio=args.consensus_ratio,
-                disable_backoff=getattr(args, "majority_vote_disable_backoff", False),
+            if len(valid_candidates) < global_quorum_k:
+                new_chars = ""
+                _vlog(
+                    verbose_log_file,
+                    f"  [Step 4] global quorum failed for majority_vote: "
+                    f"valid={len(valid_candidates)} < required={global_quorum_k} "
+                    f"from total_candidates={len(candidate_infos)}",
+                )
+            else:
+                new_chars = get_majority_vote_delta_via_llm(
+                    majority_vote_api_base, majority_vote_model, majority_vote_tokenizer,
+                    accumulated_source, committed_norm, candidate_safe_prefixes,
+                    consensus_ratio=args.consensus_ratio,
+                    disable_backoff=getattr(args, "majority_vote_disable_backoff", False),
+                    prompt_version=getattr(args, "majority_vote_prompt_version", "v2"),
+                    use_reasoning=bool(getattr(args, "majority_vote_use_reasoning", False)),
+                    reasoning_temperature=float(getattr(args, "majority_vote_reasoning_temperature", 0.6)),
+                    reasoning_max_tokens=int(getattr(args, "majority_vote_reasoning_max_tokens", 512)),
+                )
+            step4_tag = (
+                f"MajorityVote-{getattr(args, 'majority_vote_prompt_version', 'v2')}-"
+                f"{int(round(args.consensus_ratio * 100))}"
             )
-            step4_tag = f"MajorityVote{int(round(args.consensus_ratio * 100))}"
         else:
             raise ValueError(f"Unsupported selection_mode after canonicalization: {selection_mode}")
         t4 = time.perf_counter() - t4_0
@@ -2819,8 +3243,32 @@ def process_one_utterance(
               f"  [Step 4 {step4_tag}] delta ({t4:.3f}s): \"{new_chars}\"")
 
         new_chars = strip_committed_suffix_from_delta(committed_norm, new_chars)
+        repeat_guard = False
+        sentence_start_guard = False
+        if new_chars and selection_mode == "majority_vote":
+            candidate_commit = committed_norm + new_chars
+            repeat_guard = (
+                _has_repeated_substring_pattern(new_chars)
+                or _has_repeated_substring_pattern(candidate_commit)
+            )
+            local_obs_count = len(local_obs_src_ctx.strip().split()) if local_obs_src_ctx.strip() else 0
+            if current_sent_idx_ctx is not None and local_obs_count <= 2:
+                raw_support = _count_prefix_support(new_chars, candidate_safe_prefixes, normalize_leading=False)
+                norm_support = _count_prefix_support(new_chars, candidate_safe_prefixes, normalize_leading=True)
+                if max(raw_support, norm_support) < global_quorum_k:
+                    sentence_start_guard = True
+                    _vlog(
+                        verbose_log_file,
+                        f"  [Step 4 guard] sentence-start guard: support={max(raw_support, norm_support)} "
+                        f"< required={global_quorum_k} for new_chars=\"{new_chars}\"",
+                    )
+            if repeat_guard:
+                _vlog(
+                    verbose_log_file,
+                    f"  [Step 4 guard] repeated-pattern guard fired for new_chars=\"{new_chars}\"",
+                )
         risky = _ends_on_word_head(new_chars)
-        if len(new_chars) >= args.min_commit_chars and not risky:
+        if len(new_chars) >= args.min_commit_chars and not risky and not repeat_guard and not sentence_start_guard:
             committed_norm = committed_norm + new_chars
             decisions.append(("WRITE", new_chars))
             if sentence_translations and chunk_sentence_ids and chunk_pos < len(chunk_sentence_ids):
@@ -2836,7 +3284,11 @@ def process_one_utterance(
                   f"  -> WRITE \"{new_chars}\"  committed=\"{committed_norm}\"")
         else:
             decisions.append(("READ", ""))
-            if risky:
+            if repeat_guard:
+                _vlog(verbose_log_file, "  -> READ (repeat_pattern_guard)")
+            elif sentence_start_guard:
+                _vlog(verbose_log_file, "  -> READ (sentence_start_guard)")
+            elif risky:
                 _vlog(verbose_log_file,
                       f"  -> READ (word_head_guard: ends on '{new_chars[-1] if new_chars else ''}')")
             else:
@@ -2937,6 +3389,22 @@ def process_one_utterance(
             "disable_sentence_path": bool(getattr(args, "disable_sentence_path", False)),
             "base_model": args.base_model_path,
             "instruct_model": args.instruct_model_name,
+            "majority_vote_use_reasoning": bool(getattr(args, "majority_vote_use_reasoning", False)),
+            "majority_vote_reasoning_model": (
+                args.majority_vote_reasoning_model_name
+                if getattr(args, "majority_vote_use_reasoning", False)
+                else None
+            ),
+            "majority_vote_reasoning_temperature": (
+                args.majority_vote_reasoning_temperature
+                if getattr(args, "majority_vote_use_reasoning", False)
+                else None
+            ),
+            "majority_vote_reasoning_max_tokens": (
+                args.majority_vote_reasoning_max_tokens
+                if getattr(args, "majority_vote_use_reasoning", False)
+                else None
+            ),
         },
     }
     result["timing"] = {
@@ -3009,10 +3477,26 @@ def main() -> None:
         global load_align_model, get_word_alignments, truncate_by_alignment
         global get_word_alignments_batch, build_local_alignment_windows
         load_align_model = core_v2.load_align_model
-        get_word_alignments = core_v2.get_word_alignments
         truncate_by_alignment = core_v2.truncate_by_alignment
-        get_word_alignments_batch = core_v2.get_word_alignments_batch
         build_local_alignment_windows = core_v2.build_local_alignment_windows
+        # Wrap alignment calls so they use _align_model_lock when parallel_utterances > 1.
+        _orig_get_word_alignments_v2 = core_v2.get_word_alignments
+        _orig_get_word_alignments_batch_v2 = core_v2.get_word_alignments_batch
+
+        def _wrapped_get_word_alignments(src_text, tgt_text, align_model, align_tokenizer):
+            if _align_model_lock is not None:
+                with _align_model_lock:
+                    return _orig_get_word_alignments_v2(src_text, tgt_text, align_model, align_tokenizer)
+            return _orig_get_word_alignments_v2(src_text, tgt_text, align_model, align_tokenizer)
+
+        def _wrapped_get_word_alignments_batch(pairs, align_model, align_tokenizer):
+            if _align_model_lock is not None:
+                with _align_model_lock:
+                    return _orig_get_word_alignments_batch_v2(pairs, align_model, align_tokenizer)
+            return _orig_get_word_alignments_batch_v2(pairs, align_model, align_tokenizer)
+
+        get_word_alignments = _wrapped_get_word_alignments
+        get_word_alignments_batch = _wrapped_get_word_alignments_batch
         print("[Align] Using simalign (core_v2).")
 
     os.makedirs(args.output_root, exist_ok=True)
@@ -3046,6 +3530,29 @@ def main() -> None:
         cache_dir=os.environ.get("HF_HOME"),
     )
     print("[Instruct] Tokenizer loaded.")
+
+    majority_vote_api_base = api_base
+    majority_vote_model = instruct_model
+    majority_vote_tokenizer = instruct_tokenizer
+    if getattr(args, "majority_vote_use_reasoning", False):
+        majority_vote_api_base = args.majority_vote_reasoning_api_base or api_base
+        majority_vote_model = args.majority_vote_reasoning_model_name
+        try:
+            mv_client = _make_sync_client(majority_vote_api_base)
+            mv_models = mv_client.models.list()
+            print(f"[MajorityVote Reasoning] Server OK: {[m.id for m in mv_models.data]}")
+        except Exception as e:
+            print(f"ERROR: Cannot connect to majority-vote reasoning server at {majority_vote_api_base}: {e}")
+            sys.exit(1)
+        print(
+            f"[MajorityVote Reasoning] Loading tokenizer from "
+            f"{args.majority_vote_reasoning_tokenizer_path} ..."
+        )
+        majority_vote_tokenizer = load_instruct_tokenizer(
+            args.majority_vote_reasoning_tokenizer_path,
+            cache_dir=os.environ.get("HF_HOME"),
+        )
+        print("[MajorityVote Reasoning] Tokenizer loaded.")
 
     # Load base model
     print(f"[Base] Loading {args.base_model_path} (TP={args.tp}) ...")
@@ -3108,12 +3615,15 @@ def main() -> None:
         f"[Task {args.task_id}] Processing {total} rows\n"
         f"  M={args.num_candidates}, future_tokens={args.future_tokens}\n"
         f"  base={args.base_model_path}\n"
-        f"  instruct={instruct_model} @ {api_base}"
+        f"  instruct={instruct_model} @ {api_base}\n"
+        f"  majority_vote_reasoning={'ON' if getattr(args, 'majority_vote_use_reasoning', False) else 'OFF'}"
     )
 
     use_tee = getattr(args, "test_one", False) and not getattr(args, "no_tee", False)
 
-    global _base_llm_lock, _future_sampling_request_queue, _future_sampling_worker_thread
+    global _base_llm_lock, _align_model_lock, _future_sampling_request_queue, _future_sampling_worker_thread
+    if args.parallel_utterances > 1:
+        _align_model_lock = threading.Lock()
     batch_size = getattr(args, "future_sampling_batch_size", 4)
     batch_wait = getattr(args, "future_sampling_batch_wait", 0.05)
     if args.parallel_utterances > 1 and batch_size >= 2:
@@ -3174,6 +3684,7 @@ def main() -> None:
                 result = process_one_utterance(
                     base_llm, api_base, instruct_model,
                     instruct_tokenizer,
+                    majority_vote_api_base, majority_vote_model, majority_vote_tokenizer,
                     align_model, align_tokenizer,
                     utt_id, sentences, trajectory, row, args,
                     verbose_log_file=verbose_log_file,

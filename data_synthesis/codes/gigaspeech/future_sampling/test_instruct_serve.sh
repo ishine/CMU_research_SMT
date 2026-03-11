@@ -5,13 +5,13 @@
 #   conda activate vllm
 #   bash test_instruct_serve.sh
 #
-# This uses GPU 1 (so GPU 0 can run the base model simultaneously).
+# This uses GPU 0.
 # Server listens on port 8100. Kill with Ctrl+C or `kill $(cat /tmp/vllm_serve.pid)`.
 
 set -e
 
 export HF_HOME="/data/user_data/haolingp/hf_cache"
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=0
 
 MODEL="/data/user_data/haolingp/models/Qwen3-30B-A3B-Instruct-2507-FP8"
 PORT=8100
@@ -21,9 +21,9 @@ if [[ -f /tmp/vllm_serve.pid ]]; then
   OLD_PID=$(cat /tmp/vllm_serve.pid)
   if kill -0 "${OLD_PID}" 2>/dev/null; then
     echo "Killing old vllm serve (pid ${OLD_PID})..."
-    kill "${OLD_PID}" 2>/dev/null
+    kill "${OLD_PID}" 2>/dev/null || true
     sleep 3
-    kill -9 "${OLD_PID}" 2>/dev/null
+    kill -9 "${OLD_PID}" 2>/dev/null || true
     sleep 2
   fi
 fi
@@ -35,7 +35,7 @@ if [[ -n "${PORT_PID}" ]]; then
   sleep 2
 fi
 
-echo "Starting vLLM server on GPU 1, port ${PORT} ..."
+echo "Starting vLLM server on GPU 0, port ${PORT} ..."
 echo "Model: ${MODEL}"
 echo "To stop: kill \$(cat /tmp/vllm_serve.pid)"
 
