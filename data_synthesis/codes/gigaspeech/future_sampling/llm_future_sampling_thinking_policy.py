@@ -36,12 +36,15 @@ import glob
 import json
 import math
 import os
+import queue as queue_module
 import re
 import sys
+import threading
 import textwrap
 import time
 import unicodedata
 from collections import Counter
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from typing import Any, Dict, List, Optional, Tuple
 
 from tqdm import tqdm
@@ -53,6 +56,13 @@ DEFAULT_TRANSLATION_CACHE_DIR = (
     "/data/user_data/haolingp/data_synthesis/outputs/gigaspeech/"
     "llm_full_translation_cache/train_xl_case_robust_asr_filtered"
 )
+
+
+# Shared runtime state used when parallel utterance processing is enabled.
+_base_llm_lock: Optional[threading.Lock] = None
+_align_model_lock: Optional[threading.Lock] = None
+_future_sampling_request_queue: Optional[queue_module.Queue] = None
+_future_sampling_worker_thread: Optional[threading.Thread] = None
 
 
 # =============================================================================
@@ -68,6 +78,15 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--base-model-path", default="/data/user_data/haolingp/models/Qwen3-4B-Base")
     p.add_argument("--thinking-api-base", default="http://localhost:8001/v1")
+    p.add_argument(
+        "--thinking-api-bases",
+        default="",
+        help=(
+            "Comma-separated list of OpenAI-compatible thinking API bases. "
+            "If set, requests are load-balanced across these servers and this "
+            "overrides --thinking-api-base."
+        ),
+    )
     p.add_argument("--thinking-model-name", default="Qwen/Qwen3-30B-A3B-Thinking-2507-FP8")
     p.add_argument("--thinking-tokenizer-path",
                    default="/data/user_data/haolingp/models/Qwen3-30B-A3B-Thinking-2507-FP8")
@@ -75,13 +94,37 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--task-id", type=int, default=0)
     p.add_argument("--num-tasks", type=int, default=1)
-    p.add_argument("--num-futures", type=int, default=6, help="N future continuations per step.")
-    p.add_argument("--future-tokens", type=int, default=12)
-    p.add_argument("--sample-temperature", type=float, default=0.7)
-    p.add_argument("--thinking-temperature", type=float, default=0.3)
+    p.add_argument("--num-futures", type=int, default=5, help="N future continuations per step.")
+    p.add_argument("--future-tokens", type=int, default=10)
+    p.add_argument("--sample-temperature", type=float, default=1.0)
+    p.add_argument("--thinking-temperature", type=float, default=0.1)
     p.add_argument("--thinking-max-tokens", type=int, default=16384)
     p.add_argument("--align-device", default="cuda:0",
                    help="Device for simalign check model (e.g. cuda:0 or cpu).")
+    p.add_argument(
+        "--parallel-utterances",
+        type=int,
+        default=1,
+        help=(
+            "Number of utterances to process concurrently. This is the main "
+            "throughput knob when using multiple thinking servers."
+        ),
+    )
+    p.add_argument(
+        "--future-sampling-batch-size",
+        type=int,
+        default=4,
+        help=(
+            "When parallel-utterances>1: batch this many future-sampling "
+            "requests into one base_llm.generate([src1, ...]) call."
+        ),
+    )
+    p.add_argument(
+        "--future-sampling-batch-wait",
+        type=float,
+        default=0.05,
+        help="Seconds to wait for more future-sampling requests before flushing a batch.",
+    )
 
     p.add_argument("--max-rows", type=int, default=None)
     p.add_argument("--overwrite", action="store_true")
@@ -89,6 +132,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--test-one", action="store_true")
     p.add_argument("--utt-id", default=None)
     p.add_argument("--verbose", action="store_true")
+    p.add_argument(
+        "--disable-post-simalign-check",
+        action="store_true",
+        help="Skip the post-thinking simalign safety truncation and use the raw delta directly.",
+    )
 
     return p.parse_args()
 
@@ -102,6 +150,103 @@ def setup_env() -> None:
     os.environ.setdefault("HF_HUB_CACHE", os.path.join(os.environ["HF_HOME"], "hub"))
     os.environ.setdefault("TRANSFORMERS_CACHE", os.path.join(os.environ["HF_HOME"], "transformers"))
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
+def resolve_thinking_api_bases(args: argparse.Namespace) -> List[str]:
+    raw = args.thinking_api_bases.strip()
+    if raw:
+        bases = [item.strip() for item in raw.split(",") if item.strip()]
+        if bases:
+            return bases
+    return [args.thinking_api_base]
+
+
+class ThinkingServerPool:
+    """Load-balance chat-completion requests across multiple thinking servers."""
+
+    def __init__(self, api_bases: List[str]):
+        bases = [b.strip() for b in api_bases if (b or "").strip()]
+        if not bases:
+            raise ValueError("ThinkingServerPool requires at least one API base.")
+        self._slots = [
+            {
+                "api_base": api_base,
+                "client": OpenAI(base_url=api_base, api_key="dummy"),
+                "inflight": 0,
+                "requests": 0,
+            }
+            for api_base in bases
+        ]
+        self._lock = threading.Lock()
+        self._rr = 0
+
+    def __len__(self) -> int:
+        return len(self._slots)
+
+    def _acquire_slot(self, exclude: Optional[set] = None) -> Tuple[int, Dict[str, Any]]:
+        exclude = exclude or set()
+        with self._lock:
+            candidates = [
+                (idx, slot)
+                for idx, slot in enumerate(self._slots)
+                if idx not in exclude
+            ]
+            if not candidates:
+                raise RuntimeError("No available thinking server slot.")
+            min_inflight = min(slot["inflight"] for _, slot in candidates)
+            tied = [(idx, slot) for idx, slot in candidates if slot["inflight"] == min_inflight]
+            pick_idx = self._rr % len(tied)
+            self._rr += 1
+            idx, slot = tied[pick_idx]
+            slot["inflight"] += 1
+            slot["requests"] += 1
+            return idx, slot
+
+    def _release_slot(self, idx: int) -> None:
+        with self._lock:
+            self._slots[idx]["inflight"] = max(0, self._slots[idx]["inflight"] - 1)
+
+    def list_models(self) -> List[Tuple[str, List[str]]]:
+        results: List[Tuple[str, List[str]]] = []
+        for slot in self._slots:
+            models = slot["client"].models.list()
+            results.append((slot["api_base"], [m.id for m in models.data]))
+        return results
+
+    def chat_completions_create(self, **kwargs) -> Tuple[Any, str]:
+        errors: List[str] = []
+        tried: set = set()
+        for _ in range(len(self._slots)):
+            idx, slot = self._acquire_slot(exclude=tried)
+            tried.add(idx)
+            try:
+                resp = slot["client"].chat.completions.create(**kwargs)
+                return resp, slot["api_base"]
+            except Exception as e:
+                errors.append(f"{slot['api_base']}: {type(e).__name__}: {e}")
+            finally:
+                self._release_slot(idx)
+        raise RuntimeError("All thinking servers failed: " + " | ".join(errors))
+
+    def stats(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            return [
+                {
+                    "api_base": slot["api_base"],
+                    "inflight": slot["inflight"],
+                    "requests": slot["requests"],
+                }
+                for slot in self._slots
+            ]
+
+    def close(self) -> None:
+        for slot in self._slots:
+            close_fn = getattr(slot["client"], "close", None)
+            if callable(close_fn):
+                try:
+                    close_fn()
+                except Exception:
+                    pass
 
 
 # =============================================================================
@@ -490,11 +635,19 @@ def apply_simalign_delta_check(
     alignment_pairs = [(full_src, candidate_full) for full_src in full_srcs]
 
     try:
-        batch_alignments = simalign_v2.get_word_alignments_batch(
-            alignment_pairs,
-            align_model,
-            align_tokenizer,
-        )
+        if _align_model_lock is not None:
+            with _align_model_lock:
+                batch_alignments = simalign_v2.get_word_alignments_batch(
+                    alignment_pairs,
+                    align_model,
+                    align_tokenizer,
+                )
+        else:
+            batch_alignments = simalign_v2.get_word_alignments_batch(
+                alignment_pairs,
+                align_model,
+                align_tokenizer,
+            )
     except Exception as e:
         return "", {"status": f"reject_align_error:{type(e).__name__}:{e}"}
 
@@ -576,30 +729,11 @@ def load_base_model(path: str, gpu_memory_utilization: float = 0.85) -> LLM:
     )
 
 
-def sample_futures(
-    base_llm: LLM,
-    observed_source: str,
-    num_futures: int,
-    future_tokens: int,
-    temperature: float,
-) -> Tuple[List[str], List[str]]:
-    """Sample N future English continuations from the base model."""
-    if not (observed_source or "").strip():
-        return [], []
-    params = SamplingParams(
-        temperature=temperature,
-        max_tokens=future_tokens,
-        n=num_futures,
-        top_p=0.90,
-        top_k=50,
-        presence_penalty=0.0,
-        stop=["\n"],
-    )
-    outputs = base_llm.generate([observed_source.strip()], params)
+def _postprocess_future_outputs(observed_source: str, outputs: List[Any]) -> Tuple[List[str], List[str]]:
     futures: List[str] = []
     raw_outputs: List[str] = []
     seen = set()
-    for out in outputs[0].outputs:
+    for out in outputs:
         raw = (out.text or "").strip()
         raw_outputs.append(raw)
         cleaned = clean_continuation(observed_source, raw)
@@ -610,6 +744,89 @@ def sample_futures(
                 seen.add(cleaned_key)
                 futures.append(cleaned)
     return futures, raw_outputs
+
+
+def _run_batch_future_sampling_worker(
+    base_llm: LLM,
+    num_futures: int,
+    future_tokens: int,
+    temperature: float,
+    batch_size: int,
+    batch_wait_sec: float,
+    request_queue: queue_module.Queue,
+) -> None:
+    params = SamplingParams(
+        temperature=temperature,
+        max_tokens=future_tokens,
+        n=num_futures,
+        top_p=0.90,
+        top_k=50,
+        presence_penalty=0.0,
+        stop=["\n"],
+    )
+    while True:
+        batch: List[Tuple[Optional[str], queue_module.Queue]] = []
+        try:
+            item = request_queue.get(timeout=batch_wait_sec)
+            if item[0] is None:
+                return
+            batch.append(item)
+            while len(batch) < batch_size:
+                try:
+                    item = request_queue.get_nowait()
+                    if item[0] is None:
+                        request_queue.put(item)
+                        break
+                    batch.append(item)
+                except queue_module.Empty:
+                    break
+        except queue_module.Empty:
+            continue
+        if not batch:
+            continue
+
+        observed_sources = [(src or "").strip() for src, _ in batch]
+        try:
+            outputs = base_llm.generate(observed_sources, params)
+        except Exception:
+            for _, result_q in batch:
+                result_q.put(([], []))
+            continue
+
+        for i, (observed_source, result_q) in enumerate(batch):
+            result_q.put(_postprocess_future_outputs(observed_source or "", outputs[i].outputs))
+
+
+def sample_futures(
+    base_llm: LLM,
+    observed_source: str,
+    num_futures: int,
+    future_tokens: int,
+    temperature: float,
+) -> Tuple[List[str], List[str]]:
+    """Sample N future English continuations from the base model."""
+    global _future_sampling_request_queue
+    if not (observed_source or "").strip():
+        return [], []
+    if _future_sampling_request_queue is not None:
+        result_q: queue_module.Queue = queue_module.Queue(1)
+        _future_sampling_request_queue.put((observed_source, result_q))
+        return result_q.get()
+    params = SamplingParams(
+        temperature=temperature,
+        max_tokens=future_tokens,
+        n=num_futures,
+        top_p=0.90,
+        top_k=50,
+        presence_penalty=0.0,
+        stop=["\n"],
+    )
+    if _base_llm_lock is not None:
+        with _base_llm_lock:
+            outputs = base_llm.generate([observed_source.strip()], params)
+    else:
+        outputs = base_llm.generate([observed_source.strip()], params)
+    return _postprocess_future_outputs(observed_source, outputs[0].outputs)
 
 
 # =============================================================================
@@ -695,7 +912,7 @@ def build_thinking_prompt(
 
 
 def call_thinking_model(
-    client: OpenAI,
+    thinking_pool: ThinkingServerPool,
     model: str,
     user_content: str,
     committed_chinese: str = "",
@@ -704,7 +921,7 @@ def call_thinking_model(
 ) -> Tuple[str, Dict[str, Any]]:
     """Call thinking model via chat endpoint; return content delta and debug payload."""
     messages = [{"role": "user", "content": user_content}]
-    resp = client.chat.completions.create(
+    resp, api_base = thinking_pool.chat_completions_create(
         model=model,
         messages=messages,
         temperature=temperature,
@@ -720,6 +937,7 @@ def call_thinking_model(
     )
     delta = "" if (not content_text or content_text.upper() == "EMPTY") else normalize_zh(content_text)
     return delta, {
+        "server_api_base": api_base,
         "raw_message_fields": raw_message_fields,
         "reasoning_text": reasoning_text,
         "content_text": content_text,
@@ -748,14 +966,15 @@ def build_final_completion_prompt(full_source: str, committed_chinese: str) -> s
 
 
 def force_complete_translation(
-    client: OpenAI,
+    thinking_pool: ThinkingServerPool,
     model: str,
     full_source: str,
     committed_chinese: str,
 ) -> Tuple[str, Dict[str, Any]]:
     """Get final translation using chat endpoint; return full translation and debug payload."""
-    messages = [{"role": "user", "content": build_final_completion_prompt(full_source, committed_chinese)}]
-    resp = client.chat.completions.create(
+    prompt = build_final_completion_prompt(full_source, committed_chinese)
+    messages = [{"role": "user", "content": prompt}]
+    resp, api_base = thinking_pool.chat_completions_create(
         model=model,
         messages=messages,
         temperature=0.0,
@@ -776,6 +995,7 @@ def force_complete_translation(
     new_part = normalize_zh(new_part)
     full_translation = committed_norm + new_part if committed_chinese else continuation
     return full_translation, {
+        "server_api_base": api_base,
         "raw_message_fields": raw_message_fields,
         "reasoning_text": "",
         "content_text": content_text,
@@ -791,7 +1011,7 @@ def force_complete_translation(
 
 def process_one_utterance(
     base_llm: LLM,
-    client: OpenAI,
+    thinking_pool: ThinkingServerPool,
     align_model: Any,
     align_tokenizer: Any,
     thinking_model: str,
@@ -847,15 +1067,30 @@ def process_one_utterance(
             _vlog(verbose_log_file, f"  [last] force-complete from committed len={len(normalize_zh(committed))}")
             t0 = time.perf_counter()
             full_translation, final_debug = force_complete_translation(
-                client, thinking_model, full_source, committed
+                thinking_pool, thinking_model, full_source, committed
             )
             timing["step3_final_complete_s"] += time.perf_counter() - t0
             _vlog(verbose_log_file, _format_verbose_paragraph("  [last] reasoning", final_debug["reasoning_text"]))
+            if final_debug.get("server_api_base"):
+                _vlog(verbose_log_file, f"  [last] server_api_base: {final_debug['server_api_base']!r}")
             if final_debug.get("raw_message_fields"):
                 raw_fields = final_debug["raw_message_fields"]
                 _vlog(verbose_log_file, f"  [last][raw] message.reasoning: {raw_fields.get('message.reasoning', '')!r}")
                 _vlog(verbose_log_file, f"  [last][raw] message.reasoning_content: {raw_fields.get('message.reasoning_content', '')!r}")
+                if raw_fields.get("message.content_raw", ""):
+                    _vlog(verbose_log_file, f"  [last][raw] message.content_raw: {raw_fields.get('message.content_raw', '')!r}")
                 _vlog(verbose_log_file, f"  [last][raw] message.content: {raw_fields.get('message.content', '')!r}")
+            if "temperature_ignored" in final_debug:
+                _vlog(verbose_log_file, f"  [last] temperature_requested: {final_debug.get('temperature_requested')!r}")
+                _vlog(verbose_log_file, f"  [last] temperature_sent: {final_debug.get('temperature_sent')!r}")
+                _vlog(verbose_log_file, f"  [last] temperature_ignored: {final_debug.get('temperature_ignored')!r}")
+            if final_debug.get("ran_out_of_tokens"):
+                _vlog(verbose_log_file, "  [last] ran_out_of_tokens: True")
+                _vlog(verbose_log_file, f"  [last] incomplete_details: {final_debug.get('incomplete_details')!r}")
+                if final_debug.get("partial_output"):
+                    _vlog(verbose_log_file, f"  [last] partial_output: {final_debug['partial_output']!r}")
+                if final_debug.get("ran_out_during_reasoning"):
+                    _vlog(verbose_log_file, "  [last] ran_out_during_reasoning: True")
             _vlog(verbose_log_file, f"  [last] content_text: {final_debug['content_text']!r}")
             _vlog(verbose_log_file, f"  [last] cleaned_content: {final_debug['cleaned_content']!r}")
             _vlog(verbose_log_file, f"  [last] full_translation: {full_translation!r}")
@@ -897,7 +1132,7 @@ def process_one_utterance(
         user_content = build_thinking_prompt(accumulated_source, futures, committed)
         t2_0 = time.perf_counter()
         delta, thinking_debug = call_thinking_model(
-            client,
+            thinking_pool,
             thinking_model,
             user_content,
             committed_chinese=committed,
@@ -906,24 +1141,42 @@ def process_one_utterance(
         )
         timing["step2_thinking_delta_s"] += time.perf_counter() - t2_0
         _vlog(verbose_log_file, _format_verbose_paragraph("  step2_reasoning", thinking_debug["reasoning_text"]))
+        if thinking_debug.get("server_api_base"):
+            _vlog(verbose_log_file, f"  step2_server_api_base: {thinking_debug['server_api_base']!r}")
         if thinking_debug.get("raw_message_fields"):
             raw_fields = thinking_debug["raw_message_fields"]
             _vlog(verbose_log_file, f"  step2_raw_message.reasoning: {raw_fields.get('message.reasoning', '')!r}")
             _vlog(verbose_log_file, f"  step2_raw_message.reasoning_content: {raw_fields.get('message.reasoning_content', '')!r}")
+            if raw_fields.get("message.content_raw", ""):
+                _vlog(verbose_log_file, f"  step2_raw_message.content_raw: {raw_fields.get('message.content_raw', '')!r}")
             _vlog(verbose_log_file, f"  step2_raw_message.content: {raw_fields.get('message.content', '')!r}")
+        if "temperature_ignored" in thinking_debug:
+            _vlog(verbose_log_file, f"  step2_temperature_requested: {thinking_debug.get('temperature_requested')!r}")
+            _vlog(verbose_log_file, f"  step2_temperature_sent: {thinking_debug.get('temperature_sent')!r}")
+            _vlog(verbose_log_file, f"  step2_temperature_ignored: {thinking_debug.get('temperature_ignored')!r}")
+        if thinking_debug.get("ran_out_of_tokens"):
+            _vlog(verbose_log_file, "  step2_ran_out_of_tokens: True")
+            _vlog(verbose_log_file, f"  step2_incomplete_details: {thinking_debug.get('incomplete_details')!r}")
+            if thinking_debug.get("partial_output"):
+                _vlog(verbose_log_file, f"  step2_partial_output: {thinking_debug['partial_output']!r}")
+            if thinking_debug.get("ran_out_during_reasoning"):
+                _vlog(verbose_log_file, "  step2_ran_out_during_reasoning: True")
         _vlog(verbose_log_file, f"  step2_content_text: {thinking_debug['content_text']!r}")
         _vlog(verbose_log_file, f"  step2_cleaned_content: {thinking_debug['cleaned_content']!r}")
         raw_delta = delta
-        t2a_0 = time.perf_counter()
-        delta, alignment_debug = apply_simalign_delta_check(
-            accumulated_source=accumulated_source,
-            futures=futures,
-            committed=committed,
-            delta=delta,
-            align_model=align_model,
-            align_tokenizer=align_tokenizer,
-        )
-        timing["step2_alignment_check_s"] += time.perf_counter() - t2a_0
+        if args.disable_post_simalign_check:
+            alignment_debug = {"status": "skipped_disabled", "raw_delta_used": True}
+        else:
+            t2a_0 = time.perf_counter()
+            delta, alignment_debug = apply_simalign_delta_check(
+                accumulated_source=accumulated_source,
+                futures=futures,
+                committed=committed,
+                delta=delta,
+                align_model=align_model,
+                align_tokenizer=align_tokenizer,
+            )
+            timing["step2_alignment_check_s"] += time.perf_counter() - t2a_0
         _vlog(verbose_log_file, f"  step2_delta_raw: {raw_delta!r}")
         _vlog(verbose_log_file, f"  step2_alignment_check_status: {alignment_debug.get('status', '')!r}")
         if alignment_debug.get("accepted_case"):
@@ -970,6 +1223,7 @@ def process_one_utterance(
             "num_futures": args.num_futures,
             "future_tokens": args.future_tokens,
             "thinking_model": thinking_model,
+            "thinking_api_pool_size": len(thinking_pool),
         },
         "timing": timing,
     }
@@ -1023,7 +1277,7 @@ def process_one_utterance(
 
 
 def _get_reference_from_row(row: Dict[str, str]) -> Optional[str]:
-    for key in ("tgt_text_full", "tgt_text", "target_text", "translation", "ref_text", "reference"):
+    for key in ("llm_reference_text", "tgt_text_full", "tgt_text", "target_text", "translation", "ref_text", "reference"):
         if key not in row:
             continue
         raw = row.get(key)
@@ -1122,13 +1376,21 @@ def main() -> None:
         print(f"ERROR: Cannot import simalign helpers from llm_future_sampling_core_v2.py: {e}")
         sys.exit(1)
 
-    # Thinking model (OpenAI-compatible)
-    client = OpenAI(base_url=args.thinking_api_base, api_key="dummy")
+    thinking_api_bases = resolve_thinking_api_bases(args)
     try:
-        _ = client.models.list()
+        thinking_pool = ThinkingServerPool(thinking_api_bases)
     except Exception as e:
-        print(f"ERROR: Cannot connect to thinking API at {args.thinking_api_base}: {e}")
+        print(f"ERROR: Cannot create thinking server pool: {e}")
         sys.exit(1)
+
+    try:
+        model_info = thinking_pool.list_models()
+    except Exception as e:
+        print(f"ERROR: Cannot connect to thinking API pool {thinking_api_bases}: {e}")
+        thinking_pool.close()
+        sys.exit(1)
+    for api_base, model_ids in model_info:
+        print(f"[Thinking Pool] Server OK: {api_base} -> {model_ids}")
 
     # Alignment model for post-output safety check
     print(f"[Align] Loading simalign on {args.align_device} ...")
@@ -1167,68 +1429,168 @@ def main() -> None:
 
     if not row_list:
         print("No rows to process.")
+        thinking_pool.close()
         return
 
-    print(f"[Task {args.task_id}] Processing {total} rows | thinking={args.thinking_model_name} | N={args.num_futures}")
+    print(
+        f"[Task {args.task_id}] Processing {total} rows | thinking={args.thinking_model_name} "
+        f"| N={args.num_futures} | thinking_servers={len(thinking_pool)} "
+        f"| parallel_utterances={args.parallel_utterances}"
+    )
     translation_cache = load_translation_cache(DEFAULT_TRANSLATION_CACHE_DIR)
+    use_tee = args.verbose and args.parallel_utterances <= 1
+
+    global _base_llm_lock, _align_model_lock, _future_sampling_request_queue, _future_sampling_worker_thread
+    _base_llm_lock = None
+    _align_model_lock = None
+    _future_sampling_request_queue = None
+    _future_sampling_worker_thread = None
+
+    if args.parallel_utterances > 1:
+        _align_model_lock = threading.Lock()
+        batch_size = max(0, int(args.future_sampling_batch_size))
+        if batch_size >= 2:
+            _future_sampling_request_queue = queue_module.Queue()
+            _future_sampling_worker_thread = threading.Thread(
+                target=_run_batch_future_sampling_worker,
+                args=(
+                    base_llm,
+                    args.num_futures,
+                    args.future_tokens,
+                    args.sample_temperature,
+                    batch_size,
+                    args.future_sampling_batch_wait,
+                    _future_sampling_request_queue,
+                ),
+                daemon=False,
+            )
+            _future_sampling_worker_thread.start()
+            print(
+                f"[Parallel] {args.parallel_utterances} concurrent utterances; "
+                f"future sampling batched on shared base GPU (batch_size={batch_size})."
+            )
+        else:
+            _base_llm_lock = threading.Lock()
+            print(
+                f"[Parallel] {args.parallel_utterances} concurrent utterances; "
+                "base future sampling serialized via lock."
+            )
 
     written = 0
-    for row_idx, row in tqdm(row_list, desc="utterances"):
+    skipped = 0
+    failed = 0
+    counter_lock = threading.Lock()
+    pbar = tqdm(total=total, desc=f"task_{args.task_id}")
+
+    def _do_one_row(row_idx_row):
+        row_idx, row = row_idx_row
         utt_id = str(row.get(args.id_column, "")).strip() or f"row_{row_idx}"
         out_path = os.path.join(args.output_root, f"{sanitize_filename(utt_id)}.json")
         if os.path.exists(out_path) and not args.overwrite:
-            continue
+            return "skipped", utt_id, None, out_path
 
         sentences = parse_list_column(row.get("src_text_full"))
         trajectory = parse_list_column(row.get("src_trajectory"))
         if not sentences:
-            with open(out_path, "w", encoding="utf-8") as f:
-                json.dump({"utt_id": utt_id, "error": "Empty src_text_full"}, f, ensure_ascii=False, indent=2)
-            written += 1
-            continue
+            return "error", utt_id, ValueError("Empty src_text_full"), out_path
         if not trajectory:
-            with open(out_path, "w", encoding="utf-8") as f:
-                json.dump({"utt_id": utt_id, "error": "Empty src_trajectory"}, f, ensure_ascii=False, indent=2)
-            written += 1
-            continue
+            return "error", utt_id, ValueError("Empty src_trajectory"), out_path
 
+        verbose_log_file = None
         try:
-            verbose_log_file = None
             if args.verbose:
                 verbose_log_path = os.path.join(
                     args.output_root,
                     f"verbose_{sanitize_filename(utt_id)}.log",
                 )
                 raw_file = open(verbose_log_path, "w", encoding="utf-8")
-                verbose_log_file = _TeeWriter(raw_file)
+                verbose_log_file = _TeeWriter(raw_file) if use_tee else raw_file
                 _vlog(verbose_log_file, f"[VerboseLog] writing to {verbose_log_path}")
-            try:
-                result = process_one_utterance(
-                    base_llm,
-                    client,
-                    align_model,
-                    align_tokenizer,
-                    args.thinking_model_name,
-                    utt_id,
-                    sentences,
-                    trajectory,
-                    row,
-                    args,
-                    translation_cache=translation_cache,
-                    verbose_log_file=verbose_log_file,
-                )
-            finally:
-                if verbose_log_file is not None:
-                    verbose_log_file.close()
-            with open(out_path, "w", encoding="utf-8") as f:
-                json.dump(result, f, ensure_ascii=False, indent=2)
-            written += 1
-        except Exception as e:
-            with open(out_path, "w", encoding="utf-8") as f:
-                json.dump({"utt_id": utt_id, "error": str(e)}, f, ensure_ascii=False, indent=2)
-            written += 1
 
-    print(f"[Task {args.task_id}] Done. Written {written} outputs to {args.output_root}")
+            result = process_one_utterance(
+                base_llm,
+                thinking_pool,
+                align_model,
+                align_tokenizer,
+                args.thinking_model_name,
+                utt_id,
+                sentences,
+                trajectory,
+                row,
+                args,
+                translation_cache=translation_cache,
+                verbose_log_file=verbose_log_file,
+            )
+            return "ok", utt_id, result, out_path
+        except Exception as e:
+            return "error", utt_id, e, out_path
+        finally:
+            if verbose_log_file is not None:
+                verbose_log_file.close()
+
+    def _handle_result(action, utt_id, payload, out_path):
+        nonlocal written, skipped, failed
+        if action == "skipped":
+            with counter_lock:
+                skipped += 1
+        elif action == "ok":
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            with counter_lock:
+                written += 1
+        else:
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump({"utt_id": utt_id, "error": str(payload)}, f, ensure_ascii=False, indent=2)
+            with counter_lock:
+                failed += 1
+        pbar.update(1)
+
+    try:
+        if args.parallel_utterances <= 1:
+            for row_idx_row in row_list:
+                _handle_result(*_do_one_row(row_idx_row))
+        else:
+            n_workers = max(1, args.parallel_utterances)
+            row_source = iter(row_list)
+            in_flight = set()
+
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                def _fill() -> None:
+                    while len(in_flight) < n_workers * 3:
+                        try:
+                            row_idx_row = next(row_source)
+                        except StopIteration:
+                            break
+                        in_flight.add(pool.submit(_do_one_row, row_idx_row))
+
+                _fill()
+                while in_flight:
+                    done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+                    for fut in done:
+                        in_flight.discard(fut)
+                        _handle_result(*fut.result())
+                    _fill()
+    finally:
+        pbar.close()
+        if _future_sampling_worker_thread is not None and _future_sampling_request_queue is not None:
+            _future_sampling_request_queue.put((None, None))
+            _future_sampling_worker_thread.join(timeout=10.0)
+        _future_sampling_request_queue = None
+        _future_sampling_worker_thread = None
+        _base_llm_lock = None
+        _align_model_lock = None
+        thinking_stats = thinking_pool.stats()
+        thinking_pool.close()
+
+    print(
+        f"[Task {args.task_id}] Done. written={written}, skipped={skipped}, "
+        f"failed={failed} -> {args.output_root}"
+    )
+    for stat in thinking_stats:
+        print(
+            f"[Thinking Pool] {stat['api_base']} requests={stat['requests']} "
+            f"inflight={stat['inflight']}"
+        )
 
 
 if __name__ == "__main__":
