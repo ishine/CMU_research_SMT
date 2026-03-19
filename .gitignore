@@ -16,6 +16,7 @@ data_synthesis/models/
 data_synthesis/outputs/
 data_synthesis/MFA_backup/
 outputs/
+debug_output/
 
 # ===== Logs / temp =====
 *.log
