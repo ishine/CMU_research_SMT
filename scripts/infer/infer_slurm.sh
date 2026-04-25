@@ -24,6 +24,13 @@
 # sbatch infer_slurm.sh /data/user_data/siqiouya/ckpts/infinisst-omni/gigaspeech-zh-s_origin-bsz4/v1-20260122-055820-hf Standard
 # sbatch infer_slurm.sh /data/user_data/siqiouya/ckpts/infinisst-omni/gigaspeech-zh-hibiki-s-bsz4/v0-20260326-141050-hf Standard
 
+# consensus
+# sbatch infer_slurm.sh /data/user_data/siqiouya/ckpts/infinisst-omni/gigaspeech-zh-consensus-topk1-s-bsz4/v0-20260417-041331-hf/ Standard
+# sbatch infer_slurm.sh /data/user_data/siqiouya/ckpts/infinisst-omni/gigaspeech-zh-consensus-topk5-s-bsz4/v1-20260418-002956-hf/ Standard
+# sbatch infer_slurm.sh /data/user_data/siqiouya/ckpts/infinisst-omni/gigaspeech-zh-consensus-topk5_v2-s-bsz4/v0-20260425-121058-hf/ Standard
+# sbatch infer_slurm.sh /data/user_data/siqiouya/ckpts/infinisst-omni/gigaspeech-zh-consensus-topk10-s-bsz4/v0-20260417-054614-hf/ Standard
+# sbatch infer_slurm.sh /data/user_data/siqiouya/ckpts/infinisst-omni/gigaspeech-zh-consensus-topk20-s-bsz4/v0-20260417-063646-hf/ Standard
+
 source /home/siqiouya/miniconda3/bin/activate omni_inference
 
 MODEL_PATH=$1
