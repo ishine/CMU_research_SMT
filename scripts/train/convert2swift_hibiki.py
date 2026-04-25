@@ -1,3 +1,4 @@
+import argparse
 import os
 import json
 import soundfile as sf
@@ -5,12 +6,28 @@ import pandas as pd
 import numpy as np
 from tqdm import tqdm
 
+LANG_CONFIG = {
+    'zh': {'subdir': 'hibiki-13k',    'name': 'Chinese',  'join': ''},
+    'de': {'subdir': 'hibiki_de_13k', 'name': 'German',   'join': ' '},
+    'ja': {'subdir': 'hibiki_ja_13k', 'name': 'Japanese', 'join': ''},
+}
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--lang', choices=sorted(LANG_CONFIG.keys()), default='zh',
+                    help='Target language for translation.')
+parser.add_argument('--multiplier-upper', type=int, default=12,
+                    help='Inclusive upper bound for the random multiplier (sampled from [1, multiplier_upper]).')
+args = parser.parse_args()
+assert args.multiplier_upper >= 1, "--multiplier-upper must be >= 1"
+
+lang_cfg = LANG_CONFIG[args.lang]
+
 tsv_path = '/data/group_data/li_lab/siqiouya/datasets/gigaspeech/manifests/train_xl_case_robust_asr-filtered.tsv'
 orig_manifest = pd.read_csv(tsv_path, sep='\t')
 
-manifest_root = "/data/group_data/li_lab/haolingp/data_synthesis/gigaspeech/hibiki-13k"
-audio_clips_root = "/data/group_data/li_lab/siqiouya/datasets/gigaspeech/audio_clips_zh_hibiki/"
-output_filename = "train_s_zh-hibiki.jsonl"
+manifest_root = f"/data/group_data/li_lab/haolingp/data_synthesis/gigaspeech/hibiki/{lang_cfg['subdir']}"
+audio_clips_root = f"/data/group_data/li_lab/siqiouya/datasets/gigaspeech/audio_clips_{args.lang}_hibiki/"
+output_filename = f"train_s_{args.lang}-hibiki_maxm{args.multiplier_upper}.jsonl"
 
 output_root = "/data/group_data/li_lab/siqiouya/datasets/gigaspeech/manifests/"
 os.makedirs(audio_clips_root, exist_ok=True)
@@ -40,7 +57,7 @@ for json_file in pbar:
         wav, sr = sf.read(audio_path, start=int(start), frames=int(duration))
 
         assert sr == 16000
-        multiplier = np.random.randint(1, 13)
+        multiplier = np.random.randint(1, args.multiplier_upper + 1)
         stepsize = 15360 * multiplier
 
         audio_id, segment_id = utt_id.split('_')
@@ -57,7 +74,10 @@ for json_file in pbar:
 
         targets = []
         for i in range(0, len(target_trajectory), multiplier):
-            targets.append("".join(target_trajectory[i:i+multiplier]))  # no space for Chinese
+            chunk = target_trajectory[i:i+multiplier]
+            if lang_cfg['join']:
+                chunk = [s.strip() for s in chunk if s.strip()]
+            targets.append(lang_cfg['join'].join(chunk))
 
         if len(audio_clip_paths) != len(targets):
             n_skip += 1
@@ -65,7 +85,7 @@ for json_file in pbar:
             continue
 
         messages = [
-            {"role": "system", "content": "You are a professional simultaneous interpreter. You will be given chunks of English audio and you need to translate the audio into Chinese text."},
+            {"role": "system", "content": f"You are a professional simultaneous interpreter. You will be given chunks of English audio and you need to translate the audio into {lang_cfg['name']} text."},
         ]
         for target in targets:
             messages.append({"role": "user", "content": "<audio>"})
@@ -80,3 +100,11 @@ for json_file in pbar:
 with open(os.path.join(output_root, output_filename), 'w') as f:
     for instance in instances:
         f.write(json.dumps(instance, ensure_ascii=False) + "\n")
+
+"""
+for lang in zh de ja; do
+    python scripts/train/convert2swift_hibiki.py \
+        --multiplier-upper 1 \
+        --lang ${lang}
+done
+"""
